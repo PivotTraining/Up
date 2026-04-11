@@ -1,0 +1,1250 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <title>UP</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body, #root { height: 100%; overflow: hidden; background: #000; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <script id="game-source" type="text/game-tsx">
+      // Pull React hooks from the UMD global (replaces the ES module import)
+      const { useEffect, useMemo, useRef, useState } = React;
+
+      // ─── Types ──────────────────────────────────────────────────────────────
+      type Vec2 = { x: number; y: number };
+      type GestureType =
+        | "none" | "cross_left" | "cross_right"
+        | "between_left" | "between_right"
+        | "behind_left" | "behind_right" | "shot_start";
+      type MoveState = "idle" | "dribble" | "gather" | "shooting" | "recovery";
+      type BallHand = "left" | "right";
+      type TrailPoint = { x: number; y: number; t: number };
+      type GamePhase = "menu" | "playing" | "gameover";
+      type Particle = {
+        x: number; y: number; vx: number; vy: number;
+        life: number; maxLife: number; color: string; size: number;
+        rotation: number; rotSpeed: number; type: "confetti" | "spark";
+      };
+      type ScorePopup = { x: number; y: number; text: string; life: number; vy: number };
+      type PlayerState = {
+        pos: Vec2; vel: Vec2; facing: number; stamina: number; ballHand: BallHand;
+        moveState: MoveState; dribblePhase: number; shotMeter: number;
+        shotHolding: boolean; shotReleasedAt: number | null;
+        flash: number; currentMoveLabel: string; moveTimer: number;
+      };
+      type DefenderState = {
+        pos: Vec2; vel: Vec2; facing: number; contesting: boolean; contestTimer: number;
+      };
+      type BallFlight = {
+        active: boolean; t: number; duration: number;
+        p0: Vec2; p1: Vec2; p2: Vec2;
+        quality: number; isThree: boolean; madeShot: boolean;
+      };
+      type GestureResult = { type: GestureType; confidence: number; debug: string };
+
+      // ─── Constants ───────────────────────────────────────────────────────────
+      const COURT_W = 1000;
+      const COURT_H = 1600;
+      const JOYSTICK_RADIUS = 72;
+      const MAX_TRAIL = 28;
+      const FIXED_STEP = 1 / 120;
+      const MAX_DT = 1 / 20;
+      const BASKET_WORLD: Vec2 = { x: 500, y: 210 };
+      const THREE_PT_DIST = 400;
+      const GAME_DURATION = 90;
+      const SHOT_CLOCK = 24;
+
+      // ─── Math Utils ──────────────────────────────────────────────────────────
+      const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+      const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+      const normalize = (v: Vec2): Vec2 => { const l = Math.hypot(v.x, v.y) || 1; return { x: v.x/l, y: v.y/l }; };
+      const sub = (a: Vec2, b: Vec2): Vec2 => ({ x: a.x-b.x, y: a.y-b.y });
+      const add = (a: Vec2, b: Vec2): Vec2 => ({ x: a.x+b.x, y: a.y+b.y });
+      const mul = (a: Vec2, s: number): Vec2 => ({ x: a.x*s, y: a.y*s });
+      const vdist = (a: Vec2, b: Vec2) => Math.hypot(a.x-b.x, a.y-b.y);
+
+      function rrect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+        const rr = Math.min(r, w*0.5, h*0.5);
+        ctx.beginPath();
+        ctx.moveTo(x+rr, y);
+        ctx.arcTo(x+w, y, x+w, y+h, rr);
+        ctx.arcTo(x+w, y+h, x, y+h, rr);
+        ctx.arcTo(x, y+h, x, y, rr);
+        ctx.arcTo(x, y, x+w, y, rr);
+        ctx.closePath();
+      }
+
+      function bezier(p0: Vec2, p1: Vec2, p2: Vec2, t: number): Vec2 {
+        const t1 = 1 - t;
+        return { x: t1*t1*p0.x + 2*t1*t*p1.x + t*t*p2.x, y: t1*t1*p0.y + 2*t1*t*p1.y + t*t*p2.y };
+      }
+
+      function isInsideThree(pos: Vec2): boolean { return vdist(pos, BASKET_WORLD) < THREE_PT_DIST; }
+
+      // ─── Gesture Classifier ──────────────────────────────────────────────────
+      function classifyGesture(points: TrailPoint[]): GestureResult {
+        if (points.length < 4) return { type: "none", confidence: 0, debug: "too_few" };
+        const start = points[0], end = points[points.length-1];
+        const delta = { x: end.x-start.x, y: end.y-start.y };
+        const dist2 = Math.hypot(delta.x, delta.y);
+        const duration = Math.max(1, end.t-start.t);
+        const vx = delta.x/duration, vy = delta.y/duration;
+        const absX = Math.abs(delta.x), absY = Math.abs(delta.y);
+        let signedCurvature = 0;
+        for (let i = 1; i < points.length-1; i++) {
+          const a = sub(points[i], points[i-1]), b = sub(points[i+1], points[i]);
+          signedCurvature += a.x*b.y - a.y*b.x;
+        }
+        const upward = delta.y < -56 && absY > absX*1.05;
+        const curvedEnough = Math.abs(signedCurvature) > 1800 && dist2 > 56;
+        const diagDownRight = delta.x > 36 && delta.y > 32;
+        const diagDownLeft = delta.x < -36 && delta.y > 32;
+        const strongHorizontal = absX > 48 && absX > absY*1.3;
+        if (upward && Math.abs(vy) > 0.5) return { type: "shot_start", confidence: 0.95, debug: "up_swipe" };
+        if (curvedEnough) return delta.x > 0 ? { type: "behind_right", confidence: 0.82, debug: "curve+" } : { type: "behind_left", confidence: 0.82, debug: "curve-" };
+        if (diagDownRight) return { type: "between_right", confidence: 0.84, debug: "diag_r" };
+        if (diagDownLeft) return { type: "between_left", confidence: 0.84, debug: "diag_l" };
+        if (strongHorizontal) {
+          if (delta.x > 0 && Math.abs(vx) > 0.5) return { type: "cross_right", confidence: 0.9, debug: "horiz_r" };
+          if (delta.x < 0 && Math.abs(vx) > 0.5) return { type: "cross_left", confidence: 0.9, debug: "horiz_l" };
+        }
+        return { type: "none", confidence: 0.2, debug: "unknown" };
+      }
+
+      function useDevicePixelRatio() {
+        const [dpr, setDpr] = useState(1);
+        useEffect(() => {
+          const update = () => setDpr(Math.min(window.devicePixelRatio || 1, 3));
+          update();
+          window.addEventListener("resize", update);
+          return () => window.removeEventListener("resize", update);
+        }, []);
+        return dpr;
+      }
+
+      // ─── Main Component ──────────────────────────────────────────────────────
+      function BasketballGame() {
+        const canvasRef = useRef<HTMLCanvasElement | null>(null);
+        const wrapRef = useRef<HTMLDivElement | null>(null);
+        const dpr = useDevicePixelRatio();
+
+        const [uiStats, setUiStats] = useState({
+          fps: 0, score: 0, timeLeft: GAME_DURATION,
+          phase: "menu" as GamePhase, move: "Idle", shot: "--",
+        });
+
+        const simRef = useRef({
+          phase: "menu" as GamePhase,
+          score: 0, timeLeft: GAME_DURATION, shotClock: SHOT_CLOCK, justStarted: false,
+          player: {
+            pos: { x: COURT_W*0.5, y: COURT_H*0.68 }, vel: { x: 0, y: 0 },
+            facing: -Math.PI/2, stamina: 1, ballHand: "right" as BallHand,
+            moveState: "idle" as MoveState, dribblePhase: 0, shotMeter: 0,
+            shotHolding: false, shotReleasedAt: null as number|null,
+            flash: 0, currentMoveLabel: "Idle", moveTimer: 0,
+          } as PlayerState,
+          defender: {
+            pos: { x: COURT_W*0.52, y: COURT_H*0.44 }, vel: { x: 0, y: 0 },
+            facing: Math.PI/2, contesting: false, contestTimer: 0,
+          } as DefenderState,
+          ballFlight: {
+            active: false, t: 0, duration: 0,
+            p0: { x:0,y:0 }, p1: { x:0,y:0 }, p2: { x:0,y:0 },
+            quality: 0, isThree: false, madeShot: false,
+          } as BallFlight,
+          particles: [] as Particle[],
+          scorePopups: [] as ScorePopup[],
+          joystickOrigin: { x: 120, y: 1320 } as Vec2,
+          joystickKnob: { x: 120, y: 1320 } as Vec2,
+          moveInput: { x: 0, y: 0 } as Vec2,
+          pointerMap: new Map<number, Vec2>(),
+          leftStickId: null as number|null,
+          gestureId: null as number|null,
+          gestureTrail: [] as TrailPoint[],
+          gestureDebug: "—",
+          accumulator: 0, lastTime: 0,
+          fpsSamples: [] as number[],
+          arenaW: 0, arenaH: 0,
+        });
+
+        const CONFETTI_COLORS = useMemo(
+          () => ["#ff4444","#00d4ff","#ffd700","#44ff88","#ff88ff","#ff8800","#ffffff"], []
+        );
+
+        useEffect(() => {
+          const canvas = canvasRef.current, wrap = wrapRef.current;
+          if (!canvas || !wrap) return;
+          const ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
+          if (!ctx) return;
+          const sim = simRef.current;
+
+          const resize = () => {
+            const rect = wrap.getBoundingClientRect();
+            const w = Math.floor(rect.width), h = Math.floor(rect.height);
+            canvas.width = Math.floor(w*dpr); canvas.height = Math.floor(h*dpr);
+            canvas.style.width = `${w}px`; canvas.style.height = `${h}px`;
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+            sim.arenaW = w; sim.arenaH = h;
+          };
+          resize();
+          const ro = new ResizeObserver(resize);
+          ro.observe(wrap);
+
+          const toScreen = (w: Vec2): Vec2 => ({ x: (w.x/COURT_W)*sim.arenaW, y: (w.y/COURT_H)*sim.arenaH });
+          const ws = (u: number) => u*(sim.arenaW/COURT_W);
+
+          // Particles
+          const emitScore = (sx: number, sy: number, isThree: boolean) => {
+            for (let i = 0; i < (isThree ? 48 : 28); i++) {
+              const angle = Math.random()*Math.PI*2, speed = 90+Math.random()*220;
+              sim.particles.push({
+                x:sx, y:sy, vx:Math.cos(angle)*speed, vy:Math.sin(angle)*speed-120,
+                life:1, maxLife:0.9+Math.random()*0.4,
+                color: CONFETTI_COLORS[Math.floor(Math.random()*CONFETTI_COLORS.length)],
+                size:5+Math.random()*7, rotation:Math.random()*Math.PI*2,
+                rotSpeed:(Math.random()-0.5)*10, type:"confetti",
+              });
+            }
+            for (let i = 0; i < 14; i++) {
+              const angle = (i/14)*Math.PI*2;
+              sim.particles.push({
+                x:sx, y:sy, vx:Math.cos(angle)*140, vy:Math.sin(angle)*140,
+                life:1, maxLife:0.5, color:"#ffd700", size:3,
+                rotation:0, rotSpeed:0, type:"spark",
+              });
+            }
+          };
+
+          const addPopup = (wx: number, wy: number, text: string) => {
+            const s = toScreen({ x:wx, y:wy });
+            sim.scorePopups.push({ x:s.x, y:s.y, text, life:1.2, vy:-70 });
+          };
+
+          const launchShot = (quality: number) => {
+            if (sim.ballFlight.active) return;
+            const p = sim.player;
+            const three = !isInsideThree(p.pos);
+            const d = vdist(p.pos, BASKET_WORLD);
+            const flightTime = 0.45 + d/1100;
+            const midX = (p.pos.x+BASKET_WORLD.x)*0.5;
+            const midY = Math.min(p.pos.y, BASKET_WORLD.y) - COURT_H*(0.22+quality*0.12);
+            const delta = Math.abs(quality-0.68);
+            let madeShot = false;
+            if (delta < 0.05) madeShot = true;
+            else if (delta < 0.13) madeShot = Math.random() < 0.52;
+            sim.ballFlight = { active:true, t:0, duration:flightTime, p0:{...p.pos}, p1:{x:midX,y:midY}, p2:{...BASKET_WORLD}, quality, isThree:three, madeShot };
+          };
+
+          const resolveShot = () => {
+            const bf = sim.ballFlight;
+            if (!bf.madeShot) return;
+            const pts = bf.isThree ? 3 : 2;
+            sim.score += pts;
+            sim.shotClock = SHOT_CLOCK;
+            const bs = toScreen(BASKET_WORLD);
+            emitScore(bs.x, bs.y, bf.isThree);
+            addPopup(BASKET_WORLD.x, BASKET_WORLD.y-100, bf.isThree ? "+3" : "+2");
+          };
+
+          const triggerMove = (type: GestureType) => {
+            const p = sim.player;
+            if (type === "none" || sim.phase !== "playing") return;
+            if (type === "shot_start") {
+              p.moveState="gather"; p.shotHolding=true; p.shotMeter=0;
+              p.currentMoveLabel="Loading…"; p.moveTimer=0.25; return;
+            }
+            p.moveState="dribble"; p.moveTimer=0.18; p.flash=1;
+            switch(type) {
+              case "cross_left":    p.ballHand="left";  p.currentMoveLabel="Crossover ←"; p.vel.x-=85; break;
+              case "cross_right":   p.ballHand="right"; p.currentMoveLabel="Crossover →"; p.vel.x+=85; break;
+              case "between_left":  p.ballHand="left";  p.currentMoveLabel="Btw Legs ←";  p.vel.x-=62; p.vel.y-=32; break;
+              case "between_right": p.ballHand="right"; p.currentMoveLabel="Btw Legs →";  p.vel.x+=62; p.vel.y-=32; break;
+              case "behind_left":   p.ballHand="left";  p.currentMoveLabel="Behind ←";    p.vel.x-=74; break;
+              case "behind_right":  p.ballHand="right"; p.currentMoveLabel="Behind →";    p.vel.x+=74; break;
+            }
+          };
+
+          const endShot = () => {
+            const p = sim.player;
+            if (!p.shotHolding) return;
+            p.shotHolding=false; p.moveState="shooting";
+            p.shotReleasedAt=p.shotMeter; p.moveTimer=0.32;
+            p.currentMoveLabel="Release!"; p.flash=1;
+            launchShot(p.shotMeter);
+          };
+
+          const getPoint = (e: PointerEvent): Vec2 => {
+            const rect = canvas.getBoundingClientRect();
+            return { x: e.clientX-rect.left, y: e.clientY-rect.top };
+          };
+
+          const resetGame = () => {
+            sim.phase="playing"; sim.score=0; sim.timeLeft=GAME_DURATION;
+            sim.shotClock=SHOT_CLOCK; sim.particles=[]; sim.scorePopups=[];
+            sim.ballFlight.active=false; sim.justStarted=true;
+            const p=sim.player;
+            p.pos={x:COURT_W*0.5,y:COURT_H*0.68}; p.vel={x:0,y:0};
+            p.moveState="idle"; p.currentMoveLabel="Idle";
+            p.shotHolding=false; p.shotReleasedAt=null; p.stamina=1; p.flash=0;
+            sim.defender.pos={x:COURT_W*0.52,y:COURT_H*0.44};
+            sim.defender.vel={x:0,y:0}; sim.moveInput={x:0,y:0};
+          };
+
+          const onPointerDown = (e: PointerEvent) => {
+            const pt = getPoint(e);
+            sim.pointerMap.set(e.pointerId, pt);
+            canvas.setPointerCapture(e.pointerId);
+            if (sim.phase==="menu"||sim.phase==="gameover") { resetGame(); return; }
+            if (sim.justStarted) { sim.justStarted=false; return; }
+            const leftZone = pt.x < sim.arenaW*0.42;
+            if (leftZone && sim.leftStickId===null) {
+              sim.leftStickId=e.pointerId; sim.joystickOrigin=pt; sim.joystickKnob=pt;
+            } else if (!leftZone && sim.gestureId===null) {
+              sim.gestureId=e.pointerId;
+              sim.gestureTrail=[{x:pt.x,y:pt.y,t:performance.now()}];
+            }
+          };
+
+          const onPointerMove = (e: PointerEvent) => {
+            const pt = getPoint(e);
+            sim.pointerMap.set(e.pointerId, pt);
+            if (sim.leftStickId===e.pointerId) {
+              const delta=sub(pt,sim.joystickOrigin), len=Math.hypot(delta.x,delta.y);
+              const n=len>0?{x:delta.x/len,y:delta.y/len}:{x:0,y:0};
+              sim.joystickKnob=len>JOYSTICK_RADIUS?add(sim.joystickOrigin,mul(n,JOYSTICK_RADIUS)):pt;
+              sim.moveInput=len>8?n:{x:0,y:0};
+            }
+            if (sim.gestureId===e.pointerId) {
+              sim.gestureTrail.push({x:pt.x,y:pt.y,t:performance.now()});
+              if (sim.gestureTrail.length>MAX_TRAIL) sim.gestureTrail.shift();
+              if (sim.player.shotHolding) {
+                const depth=clamp((sim.gestureTrail[0].y-pt.y)/(sim.arenaH*0.18),0,1);
+                sim.player.shotMeter=depth;
+              }
+            }
+          };
+
+          const onPointerUp = (e: PointerEvent) => {
+            if (sim.leftStickId===e.pointerId) { sim.leftStickId=null; sim.moveInput={x:0,y:0}; sim.joystickKnob=sim.joystickOrigin; }
+            if (sim.gestureId===e.pointerId) {
+              if (sim.player.shotHolding) { endShot(); }
+              else {
+                const result=classifyGesture(sim.gestureTrail);
+                sim.gestureDebug=result.type==="none"?"—":result.type.replace(/_/g," ");
+                triggerMove(result.type);
+              }
+              sim.gestureId=null; sim.gestureTrail=[];
+            }
+            sim.pointerMap.delete(e.pointerId);
+            try { canvas.releasePointerCapture(e.pointerId); } catch {}
+          };
+
+          const onPointerCancel = (e: PointerEvent) => onPointerUp(e);
+          canvas.addEventListener("pointerdown", onPointerDown, { passive:false });
+          canvas.addEventListener("pointermove", onPointerMove, { passive:true });
+          canvas.addEventListener("pointerup", onPointerUp, { passive:true });
+          canvas.addEventListener("pointercancel", onPointerCancel, { passive:true });
+
+          // ── Simulation ─────────────────────────────────────────────────────
+          const simulate = (dt: number) => {
+            if (sim.phase!=="playing") return;
+            const p=sim.player, def=sim.defender;
+            sim.timeLeft=Math.max(0,sim.timeLeft-dt);
+            sim.shotClock=Math.max(0,sim.shotClock-dt);
+            if (sim.timeLeft<=0) { sim.phase="gameover"; return; }
+            if (sim.shotClock<=0) sim.shotClock=SHOT_CLOCK;
+
+            if (!p.shotHolding && p.moveState!=="shooting" && !sim.ballFlight.active) {
+              p.vel.x+=sim.moveInput.x*450*dt;
+              p.vel.y+=sim.moveInput.y*450*dt;
+            }
+            p.vel.x*=Math.exp(-8.8*dt); p.vel.y*=Math.exp(-8.8*dt);
+            const spd=Math.hypot(p.vel.x,p.vel.y);
+            if (spd>240) { const n=normalize(p.vel); p.vel=mul(n,240); }
+            p.pos.x=clamp(p.pos.x+p.vel.x*dt,100,COURT_W-100);
+            p.pos.y=clamp(p.pos.y+p.vel.y*dt,300,COURT_H-120);
+            if (spd>3) p.facing=lerp(p.facing,Math.atan2(p.vel.y,p.vel.x),0.18);
+            p.dribblePhase+=dt*(4+spd*0.026);
+            p.flash=Math.max(0,p.flash-dt*3.5);
+            p.moveTimer=Math.max(0,p.moveTimer-dt);
+            if (p.shotHolding) { p.shotMeter=clamp(p.shotMeter+dt*0.32,0,1); p.currentMoveLabel="Shot Load"; }
+            if (p.moveState==="shooting"&&p.moveTimer<=0) { p.moveState="recovery"; p.moveTimer=0.14; }
+            else if (p.moveState==="recovery"&&p.moveTimer<=0) { p.moveState="idle"; p.currentMoveLabel=spd>10?"Move":"Idle"; }
+            else if (p.moveState==="dribble"&&p.moveTimer<=0) { p.moveState="idle"; p.currentMoveLabel=spd>10?"Move":"Idle"; }
+            else if (p.moveState==="gather"&&!p.shotHolding&&p.moveTimer<=0) p.moveState="idle";
+            p.stamina=clamp(p.stamina-spd*0.00006*dt+0.045*dt,0.2,1);
+
+            const toDef=sub(p.pos,def.pos), defDist=Math.hypot(toDef.x,toDef.y);
+            const defSpeed=clamp(165+sim.score*1.8,165,250), desired=135;
+            if (defDist>desired+25) { const n=normalize(toDef); def.vel.x=lerp(def.vel.x,n.x*defSpeed,dt*4.5); def.vel.y=lerp(def.vel.y,n.y*defSpeed,dt*4.5); }
+            else if (defDist<desired-25) { const n=normalize(toDef); def.vel.x=lerp(def.vel.x,-n.x*defSpeed*0.5,dt*4); def.vel.y=lerp(def.vel.y,-n.y*defSpeed*0.5,dt*4); }
+            else { def.vel.x=lerp(def.vel.x,p.vel.x*0.72,dt*3.5); def.vel.y=lerp(def.vel.y,p.vel.y*0.42,dt*3.5); }
+            def.vel.x*=Math.exp(-5.5*dt); def.vel.y*=Math.exp(-5.5*dt);
+            def.pos.x=clamp(def.pos.x+def.vel.x*dt,80,COURT_W-80);
+            def.pos.y=clamp(def.pos.y+def.vel.y*dt,180,COURT_H-180);
+            def.facing=lerp(def.facing,Math.atan2(p.pos.y-def.pos.y,p.pos.x-def.pos.x),dt*5.5);
+            def.contesting=defDist<170&&p.moveState==="shooting";
+            def.contestTimer=Math.max(0,def.contestTimer-dt);
+            if (def.contesting) def.contestTimer=0.35;
+
+            const bf=sim.ballFlight;
+            if (bf.active) {
+              bf.t+=dt/bf.duration;
+              if (bf.t>=1) { bf.t=1; bf.active=false; resolveShot(); p.moveState="recovery"; p.moveTimer=0.4; }
+            }
+
+            for (let i=sim.particles.length-1;i>=0;i--) {
+              const part=sim.particles[i];
+              part.x+=part.vx*dt; part.y+=part.vy*dt; part.vy+=320*dt;
+              part.vx*=Math.exp(-1.8*dt); part.rotation+=part.rotSpeed*dt;
+              part.life-=dt/part.maxLife;
+              if (part.life<=0) sim.particles.splice(i,1);
+            }
+            for (let i=sim.scorePopups.length-1;i>=0;i--) {
+              const sp=sim.scorePopups[i];
+              sp.y+=sp.vy*dt; sp.vy*=Math.exp(-2.5*dt); sp.life-=dt;
+              if (sp.life<=0) sim.scorePopups.splice(i,1);
+            }
+          };
+
+          // ── Draw Court ─────────────────────────────────────────────────────
+          const drawCourt = () => {
+            const W=sim.arenaW, H=sim.arenaH;
+            const floorGrad=ctx.createLinearGradient(0,0,0,H);
+            floorGrad.addColorStop(0,"#c8892a"); floorGrad.addColorStop(0.5,"#b87828"); floorGrad.addColorStop(1,"#a06820");
+            ctx.fillStyle=floorGrad; ctx.fillRect(0,0,W,H);
+            ctx.save();
+            const plankW=Math.max(12,W/24);
+            for (let x=0;x<W;x+=plankW) { ctx.fillStyle=Math.floor(x/plankW)%2===0?"rgba(255,210,140,0.09)":"rgba(0,0,0,0.07)"; ctx.fillRect(x,0,plankW,H); }
+            ctx.restore();
+            const sl=ctx.createRadialGradient(W*0.5,H*0.06,0,W*0.5,H*0.5,H*0.7);
+            sl.addColorStop(0,"rgba(255,248,210,0.14)"); sl.addColorStop(0.55,"rgba(0,0,0,0)");
+            ctx.fillStyle=sl; ctx.fillRect(0,0,W,H);
+
+            const paintX=W*0.28, paintW=W*0.44, paintH=H*0.21;
+            const paintGrad=ctx.createLinearGradient(0,0,0,paintH);
+            paintGrad.addColorStop(0,"#c81e3a"); paintGrad.addColorStop(1,"#8a1228");
+            ctx.fillStyle=paintGrad; ctx.fillRect(paintX,0,paintW,paintH);
+            ctx.strokeStyle="rgba(255,255,255,0.55)"; ctx.lineWidth=2;
+            for (let i=0;i<4;i++) {
+              const my=paintH*(0.44+i*0.14);
+              ctx.beginPath(); ctx.moveTo(paintX-W*0.025,my); ctx.lineTo(paintX,my); ctx.stroke();
+              ctx.beginPath(); ctx.moveTo(paintX+paintW,my); ctx.lineTo(paintX+paintW+W*0.025,my); ctx.stroke();
+            }
+            ctx.strokeStyle="rgba(255,255,255,0.92)"; ctx.lineWidth=Math.max(2.5,W/200);
+            ctx.strokeRect(paintX,0,paintW,paintH);
+
+            const ftCX=W*0.5, ftCY=paintH, ftR=paintW*0.5;
+            ctx.beginPath(); ctx.arc(ftCX,ftCY,ftR,0,Math.PI,false); ctx.stroke();
+            ctx.setLineDash([8,7]);
+            ctx.beginPath(); ctx.arc(ftCX,ftCY,ftR,Math.PI,Math.PI*2,false); ctx.stroke();
+            ctx.setLineDash([]);
+
+            ctx.strokeStyle="rgba(255,255,255,0.95)"; ctx.lineWidth=Math.max(4,W/90);
+            ctx.beginPath(); ctx.moveTo(W*0.405,H*0.046); ctx.lineTo(W*0.595,H*0.046); ctx.stroke();
+            ctx.lineWidth=2; ctx.strokeRect(W*0.458,H*0.030,W*0.084,H*0.025);
+
+            const rimS=toScreen(BASKET_WORLD), rimR=ws(38);
+            const rimGlow=ctx.createRadialGradient(rimS.x,rimS.y,0,rimS.x,rimS.y,rimR*3.2);
+            rimGlow.addColorStop(0,"rgba(255,140,30,0.55)"); rimGlow.addColorStop(0.4,"rgba(255,100,10,0.18)"); rimGlow.addColorStop(1,"rgba(255,80,0,0)");
+            ctx.fillStyle=rimGlow; ctx.beginPath(); ctx.arc(rimS.x,rimS.y,rimR*3.2,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle="#ff6600"; ctx.lineWidth=Math.max(5,W/80);
+            ctx.beginPath(); ctx.arc(rimS.x,rimS.y,rimR,0,Math.PI*2); ctx.stroke();
+
+            const basketS=toScreen(BASKET_WORLD), threeR=ws(THREE_PT_DIST);
+            const cornerX_L=W*0.085, cornerX_R=W*0.915;
+            const dx_L=basketS.x-cornerX_L, dx_R=cornerX_R-basketS.x;
+            const cornerY_L=basketS.y+Math.sqrt(Math.max(0,threeR*threeR-dx_L*dx_L));
+            const cornerY_R=basketS.y+Math.sqrt(Math.max(0,threeR*threeR-dx_R*dx_R));
+            const angL=Math.atan2(cornerY_L-basketS.y,cornerX_L-basketS.x);
+            const angR=Math.atan2(cornerY_R-basketS.y,cornerX_R-basketS.x);
+            ctx.shadowColor="rgba(150,220,255,0.35)"; ctx.shadowBlur=8;
+            ctx.strokeStyle="rgba(255,255,255,0.92)"; ctx.lineWidth=Math.max(2.5,W/200);
+            ctx.beginPath(); ctx.moveTo(cornerX_L,0); ctx.lineTo(cornerX_L,cornerY_L); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(cornerX_R,0); ctx.lineTo(cornerX_R,cornerY_R); ctx.stroke();
+            ctx.beginPath(); ctx.arc(basketS.x,basketS.y,threeR,angR,angL,false); ctx.stroke();
+            ctx.shadowBlur=0;
+
+            ctx.globalAlpha=0.45; ctx.strokeStyle="rgba(255,255,255,0.9)"; ctx.lineWidth=2;
+            ctx.beginPath(); ctx.arc(rimS.x,rimS.y,ws(95),0,Math.PI,false); ctx.stroke();
+            ctx.globalAlpha=0.22;
+            ctx.beginPath(); ctx.moveTo(0,H*0.5); ctx.lineTo(W,H*0.5); ctx.stroke();
+            ctx.beginPath(); ctx.arc(W*0.5,H*0.5,W*0.1,0,Math.PI*2); ctx.stroke();
+            ctx.globalAlpha=1;
+          };
+
+          // ── Draw attached ball ──────────────────────────────────────────────
+          const drawAttachedBall = () => {
+            if (sim.ballFlight.active) return;
+            const p=sim.player, s=toScreen(p.pos);
+            const bsc=Math.min(sim.arenaW,sim.arenaH)/900;
+            const handX=p.ballHand==="right"?34:-34;
+            const bounce=Math.abs(Math.sin(p.dribblePhase*4.2));
+            const ballY=20+bounce*46, bx=s.x+handX*bsc, by=s.y+ballY*bsc, br=13*bsc;
+            ctx.fillStyle=`rgba(0,0,0,${0.18+bounce*0.12})`;
+            ctx.beginPath(); ctx.ellipse(bx,s.y+46*bsc,br*(1.4-bounce*0.5),br*0.38,0,0,Math.PI*2); ctx.fill();
+            const bg=ctx.createRadialGradient(bx,by,0,bx,by,br*2.2);
+            bg.addColorStop(0,"rgba(255,160,50,0.55)"); bg.addColorStop(1,"rgba(255,100,0,0)");
+            ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(bx,by,br*2.2,0,Math.PI*2); ctx.fill();
+            const ballGrad=ctx.createRadialGradient(bx-br*0.32,by-br*0.32,0,bx,by,br);
+            ballGrad.addColorStop(0,"#f4a455"); ballGrad.addColorStop(1,"#c96020");
+            ctx.fillStyle=ballGrad; ctx.beginPath(); ctx.arc(bx,by,br,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle="rgba(0,0,0,0.38)"; ctx.lineWidth=1.5;
+            ctx.beginPath(); ctx.moveTo(bx-br,by); ctx.lineTo(bx+br,by); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(bx,by-br); ctx.lineTo(bx,by+br); ctx.stroke();
+            ctx.fillStyle="rgba(255,255,255,0.28)";
+            ctx.beginPath(); ctx.arc(bx-br*0.26,by-br*0.28,br*0.28,0,Math.PI*2); ctx.fill();
+          };
+
+          // ── Draw ball in flight ─────────────────────────────────────────────
+          const drawBallFlight = () => {
+            const bf=sim.ballFlight;
+            if (!bf.active) return;
+            for (let i=0;i<14;i++) {
+              const t=Math.max(0,bf.t-(14-i)*0.022), pos=bezier(bf.p0,bf.p1,bf.p2,t), s=toScreen(pos);
+              ctx.fillStyle=`rgba(255,150,40,${(i/14)*0.55})`;
+              ctx.beginPath(); ctx.arc(s.x,s.y,5+i*0.7,0,Math.PI*2); ctx.fill();
+            }
+            const pos=bezier(bf.p0,bf.p1,bf.p2,bf.t), s=toScreen(pos), br=15;
+            const ss=toScreen({x:pos.x,y:COURT_H*0.97}), sc=clamp(1-bf.t*0.6,0.15,1);
+            ctx.fillStyle=`rgba(0,0,0,${0.22*sc})`;
+            ctx.beginPath(); ctx.ellipse(ss.x,ss.y,br*sc*1.6,br*sc*0.45,0,0,Math.PI*2); ctx.fill();
+            const bg=ctx.createRadialGradient(s.x,s.y,0,s.x,s.y,br*2.4);
+            bg.addColorStop(0,"rgba(255,170,50,0.7)"); bg.addColorStop(1,"rgba(255,100,0,0)");
+            ctx.fillStyle=bg; ctx.beginPath(); ctx.arc(s.x,s.y,br*2.4,0,Math.PI*2); ctx.fill();
+            const ballGrad=ctx.createRadialGradient(s.x-br*0.3,s.y-br*0.3,0,s.x,s.y,br);
+            ballGrad.addColorStop(0,"#f4a455"); ballGrad.addColorStop(1,"#c96020");
+            ctx.fillStyle=ballGrad; ctx.beginPath(); ctx.arc(s.x,s.y,br,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle="rgba(0,0,0,0.4)"; ctx.lineWidth=1.5;
+            ctx.beginPath(); ctx.moveTo(s.x-br,s.y); ctx.lineTo(s.x+br,s.y); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(s.x,s.y-br); ctx.lineTo(s.x,s.y+br); ctx.stroke();
+          };
+
+          // ── Draw player ─────────────────────────────────────────────────────
+          const drawPlayer = () => {
+            const p=sim.player, s=toScreen(p.pos);
+            const spd=Math.hypot(p.vel.x,p.vel.y);
+            const bob=Math.sin(p.dribblePhase*2.6)*Math.min(10,3+spd*0.02);
+            const bsc=Math.min(sim.arenaW,sim.arenaH)/900;
+            const legSwing=Math.sin(p.dribblePhase*2.6)*Math.min(14,spd*0.06)*bsc;
+            const armSwing=Math.sin(p.dribblePhase*2.6+Math.PI)*Math.min(12,spd*0.05)*bsc;
+            ctx.save();
+            ctx.translate(s.x,s.y+bob*0.12); ctx.rotate(p.facing*0.055);
+            ctx.fillStyle="rgba(0,0,0,0.3)";
+            ctx.beginPath(); ctx.ellipse(0,46*bsc,36*bsc,13*bsc,0,0,Math.PI*2); ctx.fill();
+            if (p.flash>0.01) {
+              const ringR=48*bsc+(1-p.flash)*18;
+              const fg=ctx.createRadialGradient(0,0,ringR*0.6,0,0,ringR);
+              fg.addColorStop(0,`rgba(0,212,255,${p.flash*0.6})`); fg.addColorStop(1,"rgba(0,212,255,0)");
+              ctx.fillStyle=fg; ctx.beginPath(); ctx.arc(0,0,ringR,0,Math.PI*2); ctx.fill();
+            }
+            ctx.strokeStyle="#1a2340"; ctx.lineWidth=11*bsc; ctx.lineCap="round";
+            ctx.beginPath();
+            ctx.moveTo(-10*bsc,34*bsc); ctx.lineTo(-16*bsc+legSwing,76*bsc);
+            ctx.moveTo(10*bsc,34*bsc); ctx.lineTo(16*bsc-legSwing,76*bsc);
+            ctx.stroke();
+            ctx.fillStyle="#e8e8e8";
+            ctx.beginPath(); ctx.ellipse(-16*bsc+legSwing,80*bsc,11*bsc,5*bsc,0,0,Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(16*bsc-legSwing,80*bsc,11*bsc,5*bsc,0,0,Math.PI*2); ctx.fill();
+            const bodyGrad=ctx.createLinearGradient(-28*bsc,-54*bsc,28*bsc,34*bsc);
+            bodyGrad.addColorStop(0,"#00d4ff"); bodyGrad.addColorStop(0.35,"#1a2340"); bodyGrad.addColorStop(1,"#0d1520");
+            ctx.fillStyle=bodyGrad; rrect(ctx,-28*bsc,-54*bsc,56*bsc,90*bsc,18*bsc); ctx.fill();
+            ctx.fillStyle="rgba(0,212,255,0.35)"; ctx.fillRect(-28*bsc,-10*bsc,56*bsc,6*bsc);
+            ctx.fillStyle="#00d4ff"; ctx.font=`bold ${Math.max(10,14*bsc)}px monospace`;
+            ctx.textAlign="center"; ctx.textBaseline="middle"; ctx.fillText("23",0,-22*bsc);
+            ctx.strokeStyle="#d4a572"; ctx.lineWidth=9*bsc; ctx.lineCap="round";
+            ctx.beginPath();
+            ctx.moveTo(-26*bsc,-24*bsc); ctx.lineTo(-36*bsc+armSwing,16*bsc);
+            ctx.moveTo(26*bsc,-24*bsc); ctx.lineTo(36*bsc-armSwing,16*bsc);
+            ctx.stroke();
+            ctx.fillStyle="#d4a572"; ctx.beginPath(); ctx.arc(0,-72*bsc,20*bsc,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle="#1a0a00"; ctx.beginPath(); ctx.ellipse(0,-80*bsc,18*bsc,10*bsc,0,0,Math.PI); ctx.fill();
+            ctx.restore(); ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+          };
+
+          // ── Draw defender ───────────────────────────────────────────────────
+          const drawDefender = () => {
+            if (sim.phase!=="playing") return;
+            const def=sim.defender, s=toScreen(def.pos);
+            const bsc=Math.min(sim.arenaW,sim.arenaH)/900;
+            const bob=Math.sin(performance.now()*0.0028)*3;
+            ctx.save(); ctx.translate(s.x,s.y+bob);
+            ctx.fillStyle="rgba(0,0,0,0.28)";
+            ctx.beginPath(); ctx.ellipse(0,46*bsc,34*bsc,12*bsc,0,0,Math.PI*2); ctx.fill();
+            if (def.contestTimer>0) {
+              ctx.globalAlpha=clamp(def.contestTimer*2,0,1);
+              ctx.strokeStyle="#ff4444"; ctx.lineWidth=4;
+              ctx.beginPath(); ctx.arc(0,0,50*bsc,0,Math.PI*2); ctx.stroke();
+              ctx.globalAlpha=1;
+            }
+            ctx.strokeStyle="#3d1515"; ctx.lineWidth=11*bsc; ctx.lineCap="round";
+            ctx.beginPath();
+            ctx.moveTo(-14*bsc,34*bsc); ctx.lineTo(-22*bsc,74*bsc);
+            ctx.moveTo(14*bsc,34*bsc); ctx.lineTo(22*bsc,74*bsc);
+            ctx.stroke();
+            ctx.fillStyle="#cc2222";
+            ctx.beginPath(); ctx.ellipse(-22*bsc,77*bsc,11*bsc,5*bsc,0,0,Math.PI*2); ctx.fill();
+            ctx.beginPath(); ctx.ellipse(22*bsc,77*bsc,11*bsc,5*bsc,0,0,Math.PI*2); ctx.fill();
+            const dg=ctx.createLinearGradient(-28*bsc,-54*bsc,28*bsc,34*bsc);
+            dg.addColorStop(0,"#ff4444"); dg.addColorStop(0.35,"#3d1515"); dg.addColorStop(1,"#1a0000");
+            ctx.fillStyle=dg; rrect(ctx,-28*bsc,-54*bsc,56*bsc,90*bsc,18*bsc); ctx.fill();
+            ctx.strokeStyle="#c07858"; ctx.lineWidth=9*bsc; ctx.lineCap="round";
+            ctx.beginPath();
+            ctx.moveTo(-26*bsc,-24*bsc); ctx.lineTo(-54*bsc,-6*bsc);
+            ctx.moveTo(26*bsc,-24*bsc); ctx.lineTo(54*bsc,-6*bsc);
+            ctx.stroke();
+            ctx.fillStyle="#c07858"; ctx.beginPath(); ctx.arc(0,-72*bsc,20*bsc,0,Math.PI*2); ctx.fill();
+            ctx.fillStyle="#0a0500"; ctx.beginPath(); ctx.ellipse(0,-80*bsc,18*bsc,10*bsc,0,0,Math.PI); ctx.fill();
+            ctx.restore();
+          };
+
+          // ── Draw joystick ───────────────────────────────────────────────────
+          const drawJoystick = () => {
+            if (sim.leftStickId===null||sim.phase!=="playing") return;
+            ctx.save();
+            ctx.fillStyle="rgba(0,212,255,0.06)";
+            ctx.beginPath(); ctx.arc(sim.joystickOrigin.x,sim.joystickOrigin.y,JOYSTICK_RADIUS,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle="rgba(0,212,255,0.32)"; ctx.lineWidth=2; ctx.stroke();
+            const kx=sim.joystickKnob.x, ky=sim.joystickKnob.y;
+            const kg=ctx.createRadialGradient(kx-6,ky-6,0,kx,ky,32);
+            kg.addColorStop(0,"rgba(0,212,255,0.6)"); kg.addColorStop(1,"rgba(0,80,180,0.28)");
+            ctx.fillStyle=kg; ctx.beginPath(); ctx.arc(kx,ky,32,0,Math.PI*2); ctx.fill();
+            ctx.strokeStyle="rgba(0,212,255,0.5)"; ctx.lineWidth=2; ctx.stroke();
+            ctx.restore();
+          };
+
+          // ── Draw gesture trail ──────────────────────────────────────────────
+          const drawGestureTrail = () => {
+            if (sim.gestureTrail.length<2) return;
+            ctx.save(); ctx.lineCap="round"; ctx.lineJoin="round";
+            for (let i=1;i<sim.gestureTrail.length;i++) {
+              const a=sim.gestureTrail[i-1], b=sim.gestureTrail[i];
+              const alpha=i/sim.gestureTrail.length;
+              ctx.strokeStyle=sim.player.shotHolding?`rgba(255,220,60,${0.12+alpha*0.72})`:`rgba(0,212,255,${0.1+alpha*0.68})`;
+              ctx.lineWidth=3+alpha*8;
+              ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+            }
+            ctx.restore();
+          };
+
+          // ── Draw shot meter ─────────────────────────────────────────────────
+          const drawShotMeter = () => {
+            const p=sim.player;
+            if (!p.shotHolding&&p.shotReleasedAt===null) return;
+            const W=sim.arenaW, H=sim.arenaH;
+            const mx=W*0.845, my=H*0.30, mw=26, mh=H*0.32;
+            ctx.save();
+            rrect(ctx,mx-14,my-20,mw+52,mh+40,20);
+            ctx.fillStyle="rgba(4,8,22,0.88)"; ctx.fill();
+            ctx.strokeStyle="rgba(255,255,255,0.14)"; ctx.lineWidth=1; ctx.stroke();
+            ctx.fillStyle="rgba(34,197,94,0.18)";
+            ctx.fillRect(mx,my+mh*(1-0.82),mw,(my+mh*(1-0.55))-(my+mh*(1-0.82)));
+            const tg=ctx.createLinearGradient(0,my+mh,0,my);
+            tg.addColorStop(0,"#ef4444"); tg.addColorStop(0.20,"#f97316"); tg.addColorStop(0.40,"#facc15");
+            tg.addColorStop(0.55,"#a3e635"); tg.addColorStop(0.68,"#22c55e");
+            tg.addColorStop(0.80,"#a3e635"); tg.addColorStop(0.90,"#facc15"); tg.addColorStop(1,"#ef4444");
+            rrect(ctx,mx,my,mw,mh,12); ctx.fillStyle="rgba(255,255,255,0.06)"; ctx.fill();
+            const filled=p.shotHolding?p.shotMeter:(p.shotReleasedAt??0);
+            const fillH=mh*clamp(filled,0,1);
+            rrect(ctx,mx,my+mh-fillH,mw,fillH,12); ctx.fillStyle=tg; ctx.fill();
+            const perfY=my+mh*(1-0.68);
+            ctx.strokeStyle="rgba(255,255,255,0.92)"; ctx.lineWidth=2;
+            ctx.setLineDash([4,3]);
+            ctx.beginPath(); ctx.moveTo(mx-7,perfY); ctx.lineTo(mx+mw+18,perfY); ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.font=`700 ${Math.max(10,W*0.027)}px Inter,system-ui,sans-serif`;
+            ctx.textAlign="center";
+            if (p.shotHolding) { ctx.fillStyle="#ffd700"; ctx.fillText("SHOT",mx+mw*0.5,my-22); }
+            else if (p.shotReleasedAt!==null) {
+              const d=Math.abs(p.shotReleasedAt-0.68);
+              let label="MISS",color="#ef4444";
+              if (d<0.05){label="GREEN!";color="#22c55e";} else if(d<0.13){label="CLOSE";color="#facc15";}
+              ctx.fillStyle=color; ctx.fillText(label,mx+mw*0.5,my-22);
+            }
+            ctx.restore(); ctx.textAlign="left";
+          };
+
+          // ── Draw HUD ────────────────────────────────────────────────────────
+          const drawHud = () => {
+            if (sim.phase!=="playing") return;
+            const W=sim.arenaW, H=sim.arenaH, pad=12;
+            ctx.save();
+            const hudW=Math.min(W*0.52,300), hudH=74, hudX=W*0.5-hudW*0.5, hudY=pad;
+            rrect(ctx,hudX,hudY,hudW,hudH,16); ctx.fillStyle="rgba(4,8,22,0.88)"; ctx.fill();
+            ctx.strokeStyle="rgba(255,255,255,0.14)"; ctx.lineWidth=1; ctx.stroke();
+            ctx.fillStyle="#ffd700"; ctx.font=`900 ${Math.max(24,W*0.068)}px Inter,system-ui,sans-serif`;
+            ctx.textAlign="center"; ctx.fillText(`${sim.score}`,W*0.5,hudY+hudH*0.65);
+            ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font=`500 ${Math.max(9,W*0.024)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("PTS",W*0.5,hudY+hudH*0.88);
+            const tM=Math.floor(sim.timeLeft/60), tS=Math.floor(sim.timeLeft%60);
+            ctx.fillStyle=sim.timeLeft<10?"#ef4444":"rgba(255,255,255,0.9)";
+            ctx.font=`700 ${Math.max(16,W*0.042)}px monospace`;
+            ctx.textAlign="right";
+            ctx.fillText(`${tM}:${tS.toString().padStart(2,"0")}`,hudX+hudW-12,hudY+hudH*0.56);
+            ctx.fillStyle="rgba(255,255,255,0.4)"; ctx.font=`400 ${Math.max(8,W*0.02)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("TIME",hudX+hudW-12,hudY+hudH*0.8);
+            const avgFps=sim.fpsSamples.reduce((a,b)=>a+b,0)/Math.max(1,sim.fpsSamples.length);
+            ctx.fillStyle="rgba(255,255,255,0.35)"; ctx.font=`400 ${Math.max(8,W*0.018)}px monospace`;
+            ctx.textAlign="left"; ctx.fillText(`${avgFps.toFixed(0)}fps`,hudX+10,hudY+hudH*0.56);
+            ctx.fillStyle="rgba(255,255,255,0.35)"; ctx.font=`400 ${Math.max(8,W*0.018)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("STM",hudX+10,hudY+hudH*0.8);
+            const stmX=hudX+10, stmY=hudY+hudH+7, stmW=hudW*0.32, stmH=5;
+            rrect(ctx,stmX,stmY,stmW,stmH,3); ctx.fillStyle="rgba(255,255,255,0.1)"; ctx.fill();
+            rrect(ctx,stmX,stmY,stmW*sim.player.stamina,stmH,3);
+            ctx.fillStyle=sim.player.stamina>0.4?"#00d4ff":"#facc15"; ctx.fill();
+            const scW=60,scH=52,scX=W-scW-pad,scY=pad,scLow=sim.shotClock<6;
+            rrect(ctx,scX,scY,scW,scH,12); ctx.fillStyle="rgba(4,8,22,0.88)"; ctx.fill();
+            ctx.strokeStyle=scLow?"#ef4444":"rgba(255,255,255,0.14)"; ctx.lineWidth=scLow?2:1; ctx.stroke();
+            ctx.fillStyle=scLow?"#ef4444":"rgba(255,255,255,0.92)";
+            ctx.font=`800 ${Math.max(18,W*0.056)}px monospace`;
+            ctx.textAlign="center";
+            ctx.fillText(Math.ceil(sim.shotClock).toString(),scX+scW*0.5,scY+scH*0.65);
+            ctx.fillStyle="rgba(255,255,255,0.38)"; ctx.font=`400 ${Math.max(8,W*0.02)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("SHOT",scX+scW*0.5,scY+scH*0.88);
+            ctx.restore(); ctx.textAlign="left"; ctx.textBaseline="alphabetic";
+          };
+
+          const drawPositionBadge = () => {
+            if (sim.phase!=="playing"||sim.ballFlight.active) return;
+            const p=sim.player, s=toScreen(p.pos), bsc=Math.min(sim.arenaW,sim.arenaH)/900;
+            const three=!isInsideThree(p.pos);
+            ctx.save(); ctx.globalAlpha=0.78;
+            ctx.fillStyle=three?"#ffd700":"#00d4ff";
+            ctx.font=`700 ${Math.max(9,sim.arenaW*0.022)}px Inter,system-ui,sans-serif`;
+            ctx.textAlign="center"; ctx.fillText(three?"3PT":"2PT",s.x,s.y-104*bsc);
+            ctx.restore(); ctx.textAlign="left";
+          };
+
+          const drawParticles = () => {
+            for (const p of sim.particles) {
+              ctx.save(); ctx.globalAlpha=clamp(p.life,0,1);
+              ctx.translate(p.x,p.y); ctx.rotate(p.rotation);
+              if (p.type==="confetti") { ctx.fillStyle=p.color; ctx.fillRect(-p.size*0.5,-p.size*0.28,p.size,p.size*0.55); }
+              else { ctx.strokeStyle=p.color; ctx.lineWidth=2.5; ctx.beginPath(); ctx.moveTo(0,0); ctx.lineTo(p.size*2.2,0); ctx.stroke(); }
+              ctx.restore();
+            }
+          };
+
+          const drawScorePopups = () => {
+            for (const sp of sim.scorePopups) {
+              ctx.save(); ctx.globalAlpha=clamp(sp.life,0,1);
+              ctx.font=`900 ${Math.max(26,sim.arenaW*0.088)}px Inter,system-ui,sans-serif`;
+              ctx.textAlign="center"; ctx.strokeStyle="rgba(0,0,0,0.55)"; ctx.lineWidth=4;
+              ctx.strokeText(sp.text,sp.x,sp.y); ctx.fillStyle="#ffd700"; ctx.fillText(sp.text,sp.x,sp.y);
+              ctx.restore();
+            }
+            ctx.textAlign="left";
+          };
+
+          const drawMenu = () => {
+            const W=sim.arenaW, H=sim.arenaH, t=performance.now()*0.001;
+            ctx.fillStyle="rgba(5,8,20,0.75)"; ctx.fillRect(0,0,W,H);
+            const gr=ctx.createRadialGradient(W*0.5,H*0.36,0,W*0.5,H*0.36,W*0.55);
+            gr.addColorStop(0,`rgba(0,212,255,${0.16+Math.sin(t)*0.06})`); gr.addColorStop(1,"rgba(0,0,0,0)");
+            ctx.fillStyle=gr; ctx.fillRect(0,H*0.1,W,H*0.6);
+            ctx.textAlign="center";
+            ctx.fillStyle="#ffffff"; ctx.font=`900 ${Math.max(30,W*0.115)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("UP",W*0.5,H*0.34);
+            ctx.fillStyle="#00d4ff"; ctx.font=`700 ${Math.max(14,W*0.046)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("BASKETBALL",W*0.5,H*0.41);
+            const btnW=W*0.58, btnH=H*0.065, btnX=W*0.5-btnW*0.5, btnY=H*0.52;
+            const pulse=1+Math.sin(t*2)*0.03;
+            ctx.save(); ctx.translate(W*0.5,btnY+btnH*0.5); ctx.scale(pulse,pulse); ctx.translate(-W*0.5,-(btnY+btnH*0.5));
+            const bg=ctx.createLinearGradient(btnX,btnY,btnX,btnY+btnH);
+            bg.addColorStop(0,"#00d4ff"); bg.addColorStop(1,"#0050cc");
+            rrect(ctx,btnX,btnY,btnW,btnH,btnH*0.5); ctx.fillStyle=bg; ctx.fill();
+            ctx.restore();
+            ctx.fillStyle="#ffffff"; ctx.font=`700 ${Math.max(15,W*0.048)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("TAP TO PLAY",W*0.5,btnY+btnH*0.66);
+            ctx.fillStyle="rgba(255,255,255,0.45)"; ctx.font=`400 ${Math.max(9,W*0.026)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("LEFT: Joystick   RIGHT: Swipe to dribble & shoot",W*0.5,H*0.65);
+            ctx.textAlign="left";
+          };
+
+          const drawGameOver = () => {
+            const W=sim.arenaW, H=sim.arenaH;
+            ctx.fillStyle="rgba(5,8,20,0.84)"; ctx.fillRect(0,0,W,H);
+            ctx.textAlign="center";
+            ctx.fillStyle="#ffffff"; ctx.font=`900 ${Math.max(22,W*0.082)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("GAME OVER",W*0.5,H*0.30);
+            ctx.fillStyle="#ffd700"; ctx.font=`900 ${Math.max(42,W*0.16)}px Inter,system-ui,sans-serif`;
+            ctx.fillText(`${sim.score}`,W*0.5,H*0.44);
+            ctx.fillStyle="rgba(255,255,255,0.55)"; ctx.font=`500 ${Math.max(13,W*0.036)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("POINTS",W*0.5,H*0.50);
+            let rating="ROOKIE";
+            if(sim.score>=30)rating="ALL STAR ★★★"; else if(sim.score>=20)rating="PRO ★★"; else if(sim.score>=10)rating="STARTER ★";
+            ctx.fillStyle="#00d4ff"; ctx.font=`700 ${Math.max(12,W*0.034)}px Inter,system-ui,sans-serif`;
+            ctx.fillText(rating,W*0.5,H*0.56);
+            const btnW=W*0.58,btnH=H*0.065,btnX=W*0.5-btnW*0.5,btnY=H*0.62;
+            const bg=ctx.createLinearGradient(btnX,btnY,btnX,btnY+btnH);
+            bg.addColorStop(0,"#ff4444"); bg.addColorStop(1,"#aa0000");
+            rrect(ctx,btnX,btnY,btnW,btnH,btnH*0.5); ctx.fillStyle=bg; ctx.fill();
+            ctx.fillStyle="#ffffff"; ctx.font=`700 ${Math.max(15,W*0.048)}px Inter,system-ui,sans-serif`;
+            ctx.fillText("PLAY AGAIN",W*0.5,btnY+btnH*0.66);
+            ctx.textAlign="left";
+          };
+
+          const draw = () => {
+            drawCourt(); drawParticles(); drawDefender(); drawPlayer();
+            drawAttachedBall(); drawBallFlight(); drawPositionBadge();
+            drawJoystick(); drawGestureTrail(); drawShotMeter(); drawHud();
+            drawScorePopups();
+            if (sim.phase==="menu") drawMenu();
+            if (sim.phase==="gameover") drawGameOver();
+          };
+
+          let raf = 0;
+          const frame = (time: number) => {
+            if (sim.lastTime===0) sim.lastTime=time;
+            const dt=Math.min((time-sim.lastTime)/1000,MAX_DT);
+            sim.lastTime=time;
+            sim.accumulator+=dt;
+            while (sim.accumulator>=FIXED_STEP) { simulate(FIXED_STEP); sim.accumulator-=FIXED_STEP; }
+            sim.fpsSamples.push(1/Math.max(dt,0.0001));
+            if (sim.fpsSamples.length>30) sim.fpsSamples.shift();
+            setUiStats(prev => {
+              const fps=sim.fpsSamples.reduce((a,b)=>a+b,0)/sim.fpsSamples.length;
+              const shotLabel=sim.player.shotReleasedAt===null?"--":Math.abs(sim.player.shotReleasedAt-0.68)<0.05?"GREEN":Math.abs(sim.player.shotReleasedAt-0.68)<0.13?"CLOSE":"MISS";
+              const next={fps,score:sim.score,timeLeft:sim.timeLeft,phase:sim.phase,move:sim.player.currentMoveLabel,shot:shotLabel};
+              if (Math.abs(prev.fps-next.fps)<3&&prev.score===next.score&&prev.phase===next.phase) return prev;
+              return next;
+            });
+            draw();
+            raf=requestAnimationFrame(frame);
+          };
+          raf=requestAnimationFrame(frame);
+
+          return () => {
+            cancelAnimationFrame(raf); ro.disconnect();
+            canvas.removeEventListener("pointerdown",onPointerDown);
+            canvas.removeEventListener("pointermove",onPointerMove);
+            canvas.removeEventListener("pointerup",onPointerUp);
+            canvas.removeEventListener("pointercancel",onPointerCancel);
+          };
+        }, [dpr, CONFETTI_COLORS]);
+
+        return (
+          <div className="flex flex-col bg-black text-white" style={{height:"100dvh"}}>
+            <div className="flex items-center justify-between px-4 py-2 flex-shrink-0 border-b border-white/10 bg-black/90">
+              <span className="text-base font-black tracking-widest text-white">JAXON</span>
+              <div className="flex gap-2">
+                <StatBadge label="PTS" value={uiStats.score.toString()} accent="#ffd700" />
+                <StatBadge label="MOVE" value={uiStats.move} />
+                <StatBadge label="SHOT" value={uiStats.shot} accent={uiStats.shot==="GREEN"?"#22c55e":undefined} />
+                <StatBadge label="FPS" value={uiStats.fps.toFixed(0)} />
+              </div>
+            </div>
+            <div ref={wrapRef} className="relative flex-1 overflow-hidden bg-black" style={{touchAction:"none"}}>
+              <canvas ref={canvasRef} className="block h-full w-full" />
+            </div>
+          </div>
+        );
+      }
+
+      function StatBadge({ label, value, accent }: { label: string; value: string; accent?: string }) {
+        return (
+          <div className="flex flex-col items-center px-2.5 py-1 rounded-xl bg-white/5 border border-white/10 min-w-[48px]">
+            <span className="text-[9px] tracking-[0.15em] text-white/38 uppercase">{label}</span>
+            <span className="text-xs font-bold truncate max-w-[64px]" style={{color: accent ?? "white"}}>{value}</span>
+          </div>
+        );
+      }
+
+      // ─── Coin Store ─────────────────────────────────────────────────────────
+      const COIN_PACKS = [
+        { id:"starter",  coins:50_000,        price:"$15", label:"Starter",  best:false },
+        { id:"allstar",  coins:1_000_000,     price:"$20", label:"All-Star", best:false },
+        { id:"max",      coins:1_000_000_000, price:"$40", label:"MAX 🔥",   best:true  },
+      ];
+      function fmtCoins(n: number){ return n>=1_000_000_000?`${n/1_000_000_000}B`:n>=1_000_000?`${n/1_000_000}M`:`${n.toLocaleString()}`; }
+
+      // ─── Home Screen ─────────────────────────────────────────────────────────
+      type Tab = "MY CAREER"|"PLAY NOW"|"TRAINING"|"CHAMPIONSHIP"|"BARBER"|"JERSEYS"|"CUSTOMIZE"|"SETTINGS";
+      const TABS: Tab[] = ["MY CAREER","PLAY NOW","TRAINING","CHAMPIONSHIP","BARBER","JERSEYS","CUSTOMIZE","SETTINGS"];
+      const TAB_ICONS: Record<Tab,string> = {
+        "MY CAREER":"🏅","PLAY NOW":"▶️","TRAINING":"🏋️","CHAMPIONSHIP":"🏆",
+        "BARBER":"✂️","JERSEYS":"👕","CUSTOMIZE":"🎨","SETTINGS":"⚙️"
+      };
+
+      function HomeScreen({ onPlay }: { onPlay: () => void }) {
+        const [tab, setTab] = useState<Tab>("MY CAREER");
+        const [coins, setCoins] = useState(1_253_975);
+        const [sound, setSound] = useState(true);
+        const [autoDribble, setAutoDribble] = useState(true);
+        const [meterShape, setMeterShape] = useState("Bar");
+        const [lang, setLang] = useState("English");
+        const [langSearch, setLangSearch] = useState("");
+        const LANGS = ["Afrikaans","Albanian","Amharic","Arabic","Armenian","Azerbaijani","Basque","Belarusian","Bengali","Bosnian","Bulgarian","Catalan","Cebuano","Chinese (Simplified)","Chinese (Traditional)","Croatian","Czech","Danish","Dutch","English","Estonian","Filipino","Finnish","French","Galician","Georgian","German","Greek","Guaraní","Haitian Creole","Hausa","Hebrew","Hindi","Hungarian","Icelandic","Igbo","Indonesian","Irish","Italian","Japanese","Javanese","Kannada","Kazakh","Khmer","Korean","Kurdish","Kyrgyz","Lao","Latvian","Lithuanian","Luxembourgish","Macedonian","Malagasy","Malay","Malayalam","Māori","Marathi","Mongolian","Nahuatl","Nepali","Norwegian","Odia","Oromo","Pashto","Persian","Polish","Portuguese (Brazil)","Portuguese (Portugal)","Punjabi","Quechua","Romanian","Russian","Samoan","Serbian","Sinhala","Slovak","Slovenian","Somali","Sotho","Spanish","Swahili","Swedish","Tamil","Telugu","Thai","Tibetan","Tigrinya","Tongan","Turkish","Turkmen","Ukrainian","Urdu","Uzbek","Vietnamese","Welsh","Wolof","Xhosa","Yoruba","Zulu"];
+        const filteredLangs = langSearch ? LANGS.filter(l=>l.toLowerCase().includes(langSearch.toLowerCase())) : LANGS;
+
+        const card = (title: string, value: string, accent="#ffd700") => (
+          <div style={{background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:14,padding:"14px 18px",minWidth:90,textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:900,color:accent}}>{value}</div>
+            <div style={{fontSize:10,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.12em",marginTop:4}}>{title}</div>
+          </div>
+        );
+
+        const toggle = (val: boolean, onToggle: ()=>void, label: string) => (
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"14px 0",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+            <span style={{fontSize:15,color:"rgba(255,255,255,0.85)"}}>{label}</span>
+            <div onClick={onToggle} style={{width:52,height:28,borderRadius:14,background:val?"#00d4ff":"rgba(255,255,255,0.15)",cursor:"pointer",position:"relative",transition:"background 0.2s"}}>
+              <div style={{position:"absolute",top:3,left:val?26:3,width:22,height:22,borderRadius:"50%",background:"#fff",transition:"left 0.2s"}}/>
+            </div>
+          </div>
+        );
+
+        const renderTab = () => {
+          switch(tab) {
+            case "MY CAREER": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{background:"linear-gradient(135deg,rgba(0,80,180,0.4),rgba(0,212,255,0.15))",border:"1px solid rgba(0,212,255,0.3)",borderRadius:18,padding:"20px 22px",marginBottom:20}}>
+                  <div style={{display:"flex",alignItems:"center",gap:16}}>
+                    <div style={{width:60,height:60,borderRadius:"50%",background:"linear-gradient(135deg,#00d4ff,#0050cc)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:26}}>🏀</div>
+                    <div>
+                      <div style={{fontSize:22,fontWeight:900,color:"#fff"}}>YOUR PLAYER</div>
+                      <div style={{fontSize:13,color:"#00d4ff",marginTop:2}}>SG · OVR 84 · 6'4"</div>
+                    </div>
+                    <div style={{marginLeft:"auto",textAlign:"center"}}>
+                      <div style={{fontSize:36,fontWeight:900,color:"#ffd700"}}>84</div>
+                      <div style={{fontSize:10,color:"rgba(255,255,255,0.4)"}}>OVERALL</div>
+                    </div>
+                  </div>
+                  <div style={{marginTop:16}}>
+                    <div style={{display:"flex",justifyContent:"space-between",fontSize:11,color:"rgba(255,255,255,0.5)",marginBottom:6}}>
+                      <span>XP TO OVR 85</span><span>1,840 / 2,500</span>
+                    </div>
+                    <div style={{height:8,borderRadius:4,background:"rgba(255,255,255,0.1)"}}>
+                      <div style={{height:"100%",borderRadius:4,background:"linear-gradient(90deg,#00d4ff,#0050cc)",width:"73.6%"}}/>
+                    </div>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:10,flexWrap:"wrap",marginBottom:20}}>
+                  {card("PPG","24.3")}
+                  {card("APG","6.1","#00d4ff")}
+                  {card("RPG","4.8","#22c55e")}
+                  {card("FG%","51%","#ffd700")}
+                  {card("3P%","38%","#a855f7")}
+                </div>
+                <div style={{background:"rgba(255,255,255,0.04)",borderRadius:14,padding:"16px 18px",marginBottom:16}}>
+                  <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>SEASON RECORD</div>
+                  <div style={{display:"flex",gap:20}}>
+                    {card("WINS","22","#22c55e")}
+                    {card("LOSSES","8","#ef4444")}
+                    {card("STREAK","W3","#ffd700")}
+                  </div>
+                </div>
+                <div style={{background:"rgba(255,255,255,0.04)",borderRadius:14,padding:"16px 18px"}}>
+                  <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:12}}>ACHIEVEMENTS</div>
+                  <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                    {["🏆 Champ","🎯 Sharpshooter","💪 Iron D","🔥 Hot Hand","✈️ High Flyer"].map(a=>(
+                      <div key={a} style={{background:"rgba(255,215,0,0.1)",border:"1px solid rgba(255,215,0,0.3)",borderRadius:20,padding:"6px 14px",fontSize:12,color:"#ffd700"}}>{a}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+
+            case "PLAY NOW": return (
+              <div style={{padding:"40px 20px",display:"flex",flexDirection:"column",gap:16}}>
+                <div style={{textAlign:"center",marginBottom:8}}>
+                  <div style={{fontSize:28,fontWeight:900,color:"#fff"}}>LET'S BALL</div>
+                  <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginTop:4}}>Choose your game mode</div>
+                </div>
+                {[
+                  {label:"QUICK MATCH",desc:"Jump right in — random opponent, your stadium",icon:"⚡",color:"#00d4ff",action:onPlay},
+                  {label:"CUSTOM GAME",desc:"Pick opponent, stadium, quarter length & difficulty",icon:"🎮",color:"#a855f7",action:onPlay},
+                  {label:"2-PLAYER LOCAL",desc:"Split controls — WASD vs Arrow keys",icon:"👥",color:"#22c55e",action:onPlay},
+                  {label:"ONLINE",desc:"Coming soon",icon:"🌐",color:"rgba(255,255,255,0.2)",action:null},
+                ].map(m=>(
+                  <div key={m.label} onClick={m.action||undefined} style={{background:"rgba(255,255,255,0.05)",border:`1px solid ${m.color}44`,borderRadius:16,padding:"18px 20px",cursor:m.action?"pointer":"default",display:"flex",alignItems:"center",gap:16,opacity:m.action?1:0.45,transition:"transform 0.1s, background 0.1s"}}
+                    onMouseEnter={e=>{if(m.action)(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.1)"}}
+                    onMouseLeave={e=>{if(m.action)(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.05)"}}>
+                    <div style={{fontSize:32}}>{m.icon}</div>
+                    <div>
+                      <div style={{fontSize:16,fontWeight:800,color:m.action?"#fff":"rgba(255,255,255,0.4)"}}>{m.label}</div>
+                      <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",marginTop:2}}>{m.desc}</div>
+                    </div>
+                    {m.action && <div style={{marginLeft:"auto",fontSize:20,color:m.color}}>›</div>}
+                  </div>
+                ))}
+              </div>
+            );
+
+            case "TRAINING": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:6}}>TRAINING DRILLS</div>
+                <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginBottom:20}}>Sharpen your game · Earn coins</div>
+                {[
+                  {name:"Shooting Range",desc:"Hit spots around the arc — track % per zone",coins:"50–200",icon:"🎯"},
+                  {name:"Dribble Course",desc:"Navigate cones with ball — timed",coins:"100–300",icon:"⚡"},
+                  {name:"Free Throw Practice",desc:"25 free throws, scores your accuracy",coins:"50",icon:"🏀"},
+                  {name:"1v1 Defense",desc:"Guard a single AI attacker",coins:"150",icon:"🛡️"},
+                  {name:"Full Court Sprint",desc:"Stamina drill — unlocks sprint boost",coins:"100",icon:"💨"},
+                  {name:"Shot Meter Master",desc:"Hit 10 consecutive PERFECT releases",coins:"500 bonus",icon:"🔥"},
+                ].map(d=>(
+                  <div key={d.name} onClick={onPlay} style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.08)",borderRadius:14,padding:"16px",marginBottom:10,cursor:"pointer",display:"flex",gap:14,alignItems:"center"}}
+                    onMouseEnter={e=>(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.09)"}
+                    onMouseLeave={e=>(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.04)"}>
+                    <div style={{fontSize:28}}>{d.icon}</div>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:14,fontWeight:700,color:"#fff"}}>{d.name}</div>
+                      <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",marginTop:2}}>{d.desc}</div>
+                    </div>
+                    <div style={{textAlign:"right"}}>
+                      <div style={{fontSize:13,fontWeight:700,color:"#ffd700"}}>🪙 {d.coins}</div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+
+            case "CHAMPIONSHIP": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:4}}>CHAMPIONSHIP</div>
+                <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginBottom:20}}>Win it all. Earn everything.</div>
+                {[
+                  {name:"Season (16 Games)",desc:"Full regular season + playoffs bracket",prize:"500,000 🪙 + Gold Trophy",icon:"🏆",color:"#ffd700"},
+                  {name:"Quick Cup (5 Games)",desc:"Shortened single-elimination bracket",prize:"150,000 🪙",icon:"🥈",color:"#c0c0c0"},
+                  {name:"Weekly Challenge",desc:"Special rules · Resets every Monday",prize:"1,000–50,000 🪙",icon:"📅",color:"#a855f7"},
+                ].map(f=>(
+                  <div key={f.name} onClick={onPlay} style={{background:"rgba(255,255,255,0.04)",border:`1px solid ${f.color}33`,borderRadius:16,padding:"20px",marginBottom:14,cursor:"pointer"}}
+                    onMouseEnter={e=>(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.09)"}
+                    onMouseLeave={e=>(e.currentTarget as HTMLElement).style.background="rgba(255,255,255,0.04)"}>
+                    <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:8}}>
+                      <div style={{fontSize:30}}>{f.icon}</div>
+                      <div>
+                        <div style={{fontSize:16,fontWeight:800,color:"#fff"}}>{f.name}</div>
+                        <div style={{fontSize:12,color:"rgba(255,255,255,0.4)"}}>{f.desc}</div>
+                      </div>
+                    </div>
+                    <div style={{background:`${f.color}18`,border:`1px solid ${f.color}44`,borderRadius:8,padding:"8px 12px",fontSize:13,color:f.color,fontWeight:700}}>🏆 Prize: {f.prize}</div>
+                  </div>
+                ))}
+              </div>
+            );
+
+            case "BARBER": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:4}}>BARBER SHOP</div>
+                <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginBottom:20}}>Style your player · All free</div>
+                <div style={{textAlign:"center",marginBottom:24}}>
+                  <div style={{width:120,height:160,margin:"0 auto",borderRadius:16,background:"linear-gradient(160deg,#1a2a4a,#0d1a30)",border:"2px solid rgba(0,212,255,0.3)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:72}}>🧍</div>
+                  <div style={{marginTop:8,fontSize:11,color:"rgba(255,255,255,0.3)"}}>Rotate to preview</div>
+                </div>
+                {[
+                  {cat:"Hair Style",opts:["Fade","Dreads","Afro","Buzz Cut","Braids","Cornrows","Waves"]},
+                  {cat:"Facial Hair",opts:["Clean","Stubble","Goatee","Full Beard","Mustache"]},
+                  {cat:"Skin Tone",opts:["1","2","3","4","5","6","7","8"]},
+                  {cat:"Accessories",opts:["Headband","Wristband","Arm Sleeve","Goggles","Chain"]},
+                ].map(section=>(
+                  <div key={section.cat} style={{marginBottom:18}}>
+                    <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>{section.cat}</div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {section.opts.map((o,i)=>(
+                        <div key={o} style={{background:i===0?"rgba(0,212,255,0.2)":"rgba(255,255,255,0.06)",border:`1px solid ${i===0?"#00d4ff":"rgba(255,255,255,0.12)"}`,borderRadius:20,padding:"6px 14px",fontSize:12,color:i===0?"#00d4ff":"rgba(255,255,255,0.7)",cursor:"pointer"}}>{o}</div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+
+            case "JERSEYS": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:4}}>JERSEY EDITOR</div>
+                <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginBottom:16}}>Design your home & away kits</div>
+                <div style={{display:"flex",gap:8,marginBottom:20}}>
+                  {["HOME","AWAY"].map((k,i)=>(
+                    <div key={k} style={{flex:1,textAlign:"center",padding:"10px",borderRadius:10,background:i===0?"rgba(0,212,255,0.15)":"rgba(255,255,255,0.05)",border:`1px solid ${i===0?"#00d4ff":"rgba(255,255,255,0.1)"}`,cursor:"pointer",fontSize:13,fontWeight:700,color:i===0?"#00d4ff":"rgba(255,255,255,0.5)"}}>{k}</div>
+                  ))}
+                </div>
+                <div style={{textAlign:"center",marginBottom:20}}>
+                  <div style={{width:100,height:130,margin:"0 auto",borderRadius:12,background:"linear-gradient(160deg,#1D428A,#0050cc)",border:"3px solid rgba(255,199,44,0.6)",display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column"}}>
+                    <div style={{fontSize:42,fontWeight:900,color:"#FFC72C"}}>7</div>
+                    <div style={{fontSize:10,color:"rgba(255,255,255,0.7)",letterSpacing:2}}>UP</div>
+                  </div>
+                </div>
+                {[
+                  {label:"Primary Color",type:"color",val:"#1D428A"},
+                  {label:"Secondary Color",type:"color",val:"#FFC72C"},
+                  {label:"Jersey Number",type:"number"},
+                  {label:"Player Name",type:"text"},
+                ].map(f=>(
+                  <div key={f.label} style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 0",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+                    <span style={{fontSize:14,color:"rgba(255,255,255,0.8)"}}>{f.label}</span>
+                    {f.type==="color"
+                      ? <input type="color" defaultValue={f.val} style={{width:36,height:36,borderRadius:8,border:"none",cursor:"pointer",background:"none"}}/>
+                      : <input type={f.type} placeholder={f.type==="number"?"0–99":"Your name"} style={{background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.15)",borderRadius:8,padding:"6px 12px",color:"#fff",fontSize:13,width:120}}/>
+                    }
+                  </div>
+                ))}
+                <div style={{marginTop:20,padding:"10px 16px 6px"}}>
+                  <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>Pattern</div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {["None","Pinstripes","Gradient","Side Panel","Camo"].map((p,i)=>(
+                      <div key={p} style={{background:i===0?"rgba(0,212,255,0.15)":"rgba(255,255,255,0.05)",border:`1px solid ${i===0?"#00d4ff":"rgba(255,255,255,0.1)"}`,borderRadius:20,padding:"6px 14px",fontSize:12,color:i===0?"#00d4ff":"rgba(255,255,255,0.6)",cursor:"pointer"}}>{p}</div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+
+            case "CUSTOMIZE": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:4}}>CUSTOMIZE</div>
+                <div style={{fontSize:13,color:"rgba(255,255,255,0.4)",marginBottom:20}}>Build your stadium · Buy upgrades</div>
+                {[
+                  {label:"STADIUM PRESETS",items:[
+                    {name:"The Palace",icon:"🏟️",cost:"Free"},
+                    {name:"Neon City",icon:"🌆",cost:"20,000 🪙"},
+                    {name:"Open Air",icon:"☀️",cost:"Free"},
+                    {name:"Blackout",icon:"🖤",cost:"15,000 🪙"},
+                    {name:"Retro Gym",icon:"🏫",cost:"Free"},
+                  ]},
+                  {label:"FLOOR",items:[
+                    {name:"Hardwood Maple",icon:"🟫",cost:"Free"},
+                    {name:"LED Panel",icon:"💡",cost:"25,000 🪙"},
+                    {name:"Glass Floor",icon:"🔷",cost:"40,000 🪙"},
+                  ]},
+                  {label:"EFFECTS",items:[
+                    {name:"Confetti Cannon",icon:"🎊",cost:"5,000 🪙"},
+                    {name:"Pyro Entry",icon:"🔥",cost:"20,000 🪙"},
+                    {name:"Smoke Machine",icon:"💨",cost:"12,000 🪙"},
+                    {name:"Spotlight Shafts",icon:"🔦",cost:"30,000 🪙"},
+                  ]},
+                ].map(section=>(
+                  <div key={section.label} style={{marginBottom:20}}>
+                    <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:10}}>{section.label}</div>
+                    <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                      {section.items.map((it,i)=>(
+                        <div key={it.name} style={{background:i===0?"rgba(0,212,255,0.1)":"rgba(255,255,255,0.04)",border:`1px solid ${i===0?"rgba(0,212,255,0.4)":"rgba(255,255,255,0.1)"}`,borderRadius:14,padding:"12px 14px",cursor:"pointer",minWidth:110,textAlign:"center"}}>
+                          <div style={{fontSize:24,marginBottom:4}}>{it.icon}</div>
+                          <div style={{fontSize:12,fontWeight:700,color:i===0?"#00d4ff":"#fff"}}>{it.name}</div>
+                          <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",marginTop:2}}>{it.cost}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+
+            case "SETTINGS": return (
+              <div style={{padding:"24px 20px"}}>
+                <div style={{fontSize:20,fontWeight:900,color:"#fff",marginBottom:20}}>SETTINGS</div>
+
+                <div style={{fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Audio</div>
+                {toggle(sound, ()=>setSound(s=>!s), `Sound ${sound?"ON":"OFF"}`)}
+
+                <div style={{marginTop:20,fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Gameplay</div>
+                {toggle(autoDribble, ()=>setAutoDribble(d=>!d), `Auto-Dribble ${autoDribble?"ON":"OFF"}`)}
+
+                <div style={{padding:"14px 0",borderBottom:"1px solid rgba(255,255,255,0.07)"}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <span style={{fontSize:15,color:"rgba(255,255,255,0.85)"}}>Shot Meter Shape</span>
+                  </div>
+                  <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+                    {["Bar","Ring","Arrow","Diamond","Flame","Custom"].map(s=>(
+                      <div key={s} onClick={()=>setMeterShape(s)} style={{background:meterShape===s?"rgba(0,212,255,0.2)":"rgba(255,255,255,0.06)",border:`1px solid ${meterShape===s?"#00d4ff":"rgba(255,255,255,0.12)"}`,borderRadius:20,padding:"6px 14px",fontSize:12,color:meterShape===s?"#00d4ff":"rgba(255,255,255,0.7)",cursor:"pointer"}}>{s}</div>
+                    ))}
+                  </div>
+                </div>
+
+                <div style={{marginTop:20,fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>Language</div>
+                <div style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:14,padding:"14px"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:10,background:"rgba(255,255,255,0.06)",borderRadius:10,padding:"8px 12px"}}>
+                    <span style={{fontSize:14}}>🔍</span>
+                    <input value={langSearch} onChange={e=>setLangSearch(e.target.value)} placeholder="Search all languages..." style={{flex:1,background:"none",border:"none",outline:"none",color:"#fff",fontSize:13}}/>
+                  </div>
+                  <div style={{maxHeight:180,overflowY:"auto"}}>
+                    {filteredLangs.map(l=>(
+                      <div key={l} onClick={()=>{setLang(l);setLangSearch("");}} style={{padding:"8px 10px",borderRadius:8,cursor:"pointer",fontSize:13,color:lang===l?"#00d4ff":"rgba(255,255,255,0.7)",background:lang===l?"rgba(0,212,255,0.1)":"transparent",display:"flex",alignItems:"center",gap:8}}>
+                        {lang===l && <span>●</span>}
+                        {lang!==l && <span style={{color:"transparent"}}>●</span>}
+                        {l}
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{marginTop:8,fontSize:11,color:"rgba(255,255,255,0.3)",textAlign:"center"}}>Current: {lang}</div>
+                </div>
+
+                <div style={{marginTop:20,fontSize:11,color:"rgba(255,255,255,0.4)",textTransform:"uppercase",letterSpacing:"0.1em",marginBottom:8}}>UpCoins</div>
+                <div style={{background:"rgba(255,255,255,0.04)",border:"1px solid rgba(255,255,255,0.1)",borderRadius:14,padding:"16px"}}>
+                  <div style={{fontSize:24,fontWeight:900,color:"#ffd700",marginBottom:4}}>🪙 {coins.toLocaleString()}</div>
+                  <div style={{fontSize:12,color:"rgba(255,255,255,0.4)",marginBottom:14}}>Your balance</div>
+                  <div style={{display:"flex",gap:8}}>
+                    {COIN_PACKS.map(p=>(
+                      <div key={p.id} onClick={()=>{ if(confirm(`Buy ${fmtCoins(p.coins)} UpCoins for ${p.price}?`)) setCoins(c=>c+p.coins); }} style={{flex:1,background:p.best?"rgba(255,215,0,0.12)":"rgba(255,255,255,0.05)",border:`2px solid ${p.best?"#ffd700":"rgba(255,255,255,0.12)"}`,borderRadius:12,padding:"12px 8px",textAlign:"center",cursor:"pointer"}}>
+                        <div style={{fontSize:14,fontWeight:800,color:p.best?"#ffd700":"#fff"}}>{p.label}</div>
+                        <div style={{fontSize:12,color:"rgba(255,255,255,0.6)",margin:"4px 0"}}>{fmtCoins(p.coins)} 🪙</div>
+                        <div style={{fontSize:16,fontWeight:900,color:p.best?"#ffd700":"#00d4ff"}}>{p.price}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            );
+
+            default: return <div style={{padding:40,color:"rgba(255,255,255,0.5)"}}>Coming soon</div>;
+          }
+        };
+
+        return (
+          <div style={{height:"100dvh",display:"flex",flexDirection:"column",background:"#050814",color:"#fff",fontFamily:"Inter,system-ui,sans-serif",overflow:"hidden"}}>
+            {/* Top bar */}
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"12px 20px",borderBottom:"1px solid rgba(255,255,255,0.08)",flexShrink:0,background:"rgba(5,8,20,0.95)",backdropFilter:"blur(12px)"}}>
+              <div style={{fontSize:24,fontWeight:900,letterSpacing:4,background:"linear-gradient(90deg,#fff,#00d4ff)",WebkitBackgroundClip:"text",WebkitTextFillColor:"transparent"}}>UP</div>
+              <div style={{fontSize:14,fontWeight:700,color:"#ffd700"}}>🪙 {coins.toLocaleString()}</div>
+            </div>
+            {/* Tab bar */}
+            <div style={{display:"flex",overflowX:"auto",borderBottom:"1px solid rgba(255,255,255,0.08)",flexShrink:0,background:"rgba(5,8,20,0.9)"}}>
+              {TABS.map(t=>(
+                <div key={t} onClick={()=>setTab(t)} style={{padding:"10px 16px",whiteSpace:"nowrap",cursor:"pointer",fontSize:11,fontWeight:700,letterSpacing:"0.06em",color:tab===t?"#00d4ff":"rgba(255,255,255,0.4)",borderBottom:`2px solid ${tab===t?"#00d4ff":"transparent"}`,transition:"color 0.15s",display:"flex",flexDirection:"column",alignItems:"center",gap:3,minWidth:70}}>
+                  <span style={{fontSize:16}}>{TAB_ICONS[t]}</span>
+                  <span>{t.replace(" ","\n")}</span>
+                </div>
+              ))}
+            </div>
+            {/* Tab content */}
+            <div style={{flex:1,overflowY:"auto"}}>
+              {renderTab()}
+            </div>
+          </div>
+        );
+      }
+
+      // ─── App Root ────────────────────────────────────────────────────────────
+      function App() {
+        const [screen, setScreen] = useState<"home"|"game">("home");
+        if (screen === "game") return <BasketballGame />;
+        return <HomeScreen onPlay={()=>setScreen("game")} />;
+      }
+
+      // Mount
+      const root = ReactDOM.createRoot(document.getElementById("root"));
+      root.render(<App />);
+    </script>
+    <script>
+      // Manually transpile and execute the game source after all CDN scripts are ready
+      (function run() {
+        var src = document.getElementById('game-source').textContent;
+        var result = Babel.transform(src, {
+          presets: ['react', 'typescript'],
+          filename: 'game.tsx'
+        });
+        // eslint-disable-next-line no-new-func
+        eval(result.code);
+      })();
+    </script>
+  </body>
+</html>
