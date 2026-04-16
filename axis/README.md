@@ -51,8 +51,8 @@ Three custom layers on top of the OpenJarvis five-pillar foundation:
 | 2 | Memory & Persona — Supabase schema + 5 lanes | ✅ Complete |
 | 3 | Calendar & Email — Microsoft Graph integration | ✅ Complete |
 | 4 | IQ Tool Wrappers — OutreachIQ, PressureIQ, SignalIQ, CompatibleIQ | ✅ Complete |
-| 5 | Cloud Fallback — Claude API for heavy reasoning | **In Progress** |
-| 6 | Vault Indexing & Specialty Tools | Planned |
+| 5 | Cloud Fallback — Claude API for heavy reasoning | ✅ Complete |
+| 6 | Vault Indexing & Specialty Tools | ✅ Complete |
 | 7 | HUD & Polish — Tauri desktop shell | Planned |
 
 ---
@@ -81,14 +81,24 @@ axis/
     signaliq.py             # SignalIQ — interface ready, wire endpoints
     compatibleiq.py         # CompatibleIQ — interface ready, wire endpoints
     iq_router.py            # Intent → IQ tool dispatcher
+    school_outreach.py      # School outreach call scripts (opener/voicemail/email/objection)
+    devotion_generator.py   # Daily devotion generator (5-component format)
+    sermon_drafting.py      # Long-form sermon content (Hook → Text → Turn)
+  vault/
+    scanner.py              # Document discovery + text extraction (docx/pdf/md/txt/csv)
+    indexer.py              # Chunk → embed → store pipeline
   intelligence/
     cloud_router.py         # Local vs Claude API routing (privacy-aware)
     privacy_guard.py        # Entity redaction before cloud calls
+  migrations/
+    001_memory_schema.sql   # Supabase migration — run in SQL editor
+    002_vault_index.sql     # Vault idempotency tracking table
   connectors/               # Custom connectors (Phase 3+)
   scripts/
     setup.sh                # One-shot install script
     start.sh                # Launch Axis
     test_voice_loop.py      # Phase 1 smoke test
+    index_vault.py          # Vault indexer CLI (--dry-run, --paths)
 ```
 
 ---

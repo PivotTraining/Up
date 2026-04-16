@@ -26,7 +26,7 @@ fallback_provider = "anthropic"
 [agent]
 default_agent = "native_react"
 max_turns = 15
-tools = "think,web_search,knowledge_search,memory_manage,file_read,calculator,calendar,email,chief_of_staff,iq_router"
+tools = "think,web_search,knowledge_search,memory_manage,file_read,calculator,calendar,email,chief_of_staff,iq_router,school_outreach,devotion_generator,sermon_drafting"
 objective = "Serve as the AI operating layer for Pivot — route to memory lanes and IQ tools based on intent"
 context_from_memory = true
 
