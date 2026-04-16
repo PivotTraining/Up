@@ -19,6 +19,7 @@ dependencies = [
     "faster-whisper>=1.2.1",
     "numpy>=2.2.6",
     "scipy>=1.15.3",
+    "soundfile>=0.13.1",
 ]
 
 [project.optional-dependencies]
