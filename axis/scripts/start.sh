@@ -40,16 +40,23 @@ else
     ollama pull qwen3:8b
 fi
 
-# Launch Axis via OpenJarvis CLI
-info "Starting Axis..."
-echo ""
+# Launch mode
+MODE="${1:-voice}"
 cd "$AXIS_DIR"
 
-PERSONA="$(cat "$AXIS_DIR/personas/axis.md")"
-
-exec uv run jarvis chat \
-    --model "qwen3:8b" \
-    --engine "ollama" \
-    --agent "native_react" \
-    --tools "think,web_search,knowledge_search,memory_manage,file_read,calculator" \
-    --system "$PERSONA"
+if [ "$MODE" = "text" ]; then
+    info "Starting Axis (text mode)..."
+    echo ""
+    PERSONA="$(cat "$AXIS_DIR/personas/axis.md")"
+    exec uv run jarvis chat \
+        --model "qwen3:8b" \
+        --engine "ollama" \
+        --agent "native_react" \
+        --tools "think,web_search,knowledge_search,memory_manage,file_read,calculator" \
+        --system "$PERSONA"
+else
+    info "Starting Axis (voice mode)..."
+    info "SPACE = talk · B = brief · Q = quit"
+    echo ""
+    exec uv run python "$AXIS_DIR/scripts/voice_loop.py"
+fi

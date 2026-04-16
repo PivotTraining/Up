@@ -15,6 +15,10 @@ dependencies = [
     "msal>=1.28",
     # Phase 5 — Cloud fallback
     "anthropic>=0.40",
+    "sounddevice>=0.5.5",
+    "faster-whisper>=1.2.1",
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
 ]
 
 [project.optional-dependencies]

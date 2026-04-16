@@ -62,8 +62,9 @@ class ChiefOfStaff:
         # ── Opening ──────────────────────────────────────────────────────
         now = datetime.now()
         day_name = now.strftime("%A")
-        date_str = now.strftime("%B %d")
+        date_str = now.strftime("%B %d, %Y")
         hour = now.hour
+        location = os.environ.get("AXIS_LOCATION", "Atlanta, Georgia")
 
         if hour < 12:
             greeting = "Good morning"
@@ -72,7 +73,7 @@ class ChiefOfStaff:
         else:
             greeting = "Good evening"
 
-        sections.append(f"{greeting}, Boss. It's {day_name}, {date_str}.")
+        sections.append(f"{greeting}, Boss. It's {day_name}, {date_str}. You're in {location}.")
 
         # ── Calendar ─────────────────────────────────────────────────────
         today_result = self._calendar.run("today")
