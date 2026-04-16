@@ -1,0 +1,79 @@
+# ──────────────────────────────────────────────
+# Axis Configuration — OpenJarvis Custom Profile
+# The Operating System of Pivot
+# ──────────────────────────────────────────────
+
+# ── PILLAR 1: Intelligence ───────────────────
+[intelligence]
+default_model = "qwen3:8b"
+fallback_model = "qwen3:8b"
+preferred_engine = "ollama"
+provider = "local"
+quantization = "none"
+temperature = 0.7
+max_tokens = 2048
+top_p = 0.9
+top_k = 40
+repetition_penalty = 1.0
+
+# ── PILLAR 2: Agent ──────────────────────────
+[agent]
+default_agent = "native_react"
+max_turns = 15
+tools = "think,web_search,knowledge_search,memory_manage,file_read,calculator"
+objective = "Serve as the AI operating layer for Pivot — route to memory lanes and IQ tools based on intent"
+context_from_memory = true
+
+# ── PILLAR 3: Tools ──────────────────────────
+[tools.storage]
+default_backend = "sqlite"
+db_path = "~/.axis/memory.db"
+
+[tools.mcp]
+enabled = true
+
+# ── PILLAR 4: Engine ─────────────────────────
+[engine]
+default = "ollama"
+
+[engine.ollama]
+host = "http://localhost:11434"
+
+# Cloud fallback — Phase 5
+# [engine.anthropic]
+# model = "claude-sonnet-4-6"
+
+# ── PILLAR 5: Learning ───────────────────────
+[learning]
+enabled = false
+
+[learning.routing]
+policy = "heuristic"
+
+[learning.metrics]
+accuracy_weight = 0.6
+latency_weight = 0.2
+cost_weight = 0.1
+efficiency_weight = 0.1
+
+# ── Telemetry ────────────────────────────────
+[telemetry]
+enabled = true
+db_path = "~/.axis/telemetry.db"
+gpu_metrics = true
+gpu_poll_interval_ms = 50
+
+# ── Traces ───────────────────────────────────
+[traces]
+enabled = true
+db_path = "~/.axis/traces.db"
+
+# ── Server ───────────────────────────────────
+[server]
+host = "127.0.0.1"
+port = 8100
+agent = "native_react"
+
+# ── Security ─────────────────────────────────
+[security]
+enabled = false
