@@ -16,10 +16,16 @@ bash axis/scripts/setup.sh
 cp axis/.env.example axis/.env
 # Edit axis/.env with your API keys
 
-# 3. Run the smoke test
+# 3. Run the smoke test (Phase 1)
 cd axis && uv run python scripts/test_voice_loop.py
 
-# 4. Start Axis
+# 4. Run the Supabase migration (Phase 2)
+# → Paste axis/migrations/001_memory_schema.sql into your Supabase SQL editor
+
+# 5. Seed initial Pivot context (Phase 2)
+cd axis && uv run python memory/seed.py
+
+# 6. Start Axis
 bash axis/scripts/start.sh
 ```
 
@@ -41,8 +47,8 @@ Three custom layers on top of the OpenJarvis five-pillar foundation:
 
 | Phase | Description | Status |
 |-------|-------------|--------|
-| 1 | Local Foundation — OpenJarvis + Ollama + voice loop | **In Progress** |
-| 2 | Memory & Persona — Supabase schema + 5 lanes | Planned |
+| 1 | Local Foundation — OpenJarvis + Ollama + voice loop | ✅ Complete |
+| 2 | Memory & Persona — Supabase schema + 5 lanes | **In Progress** |
 | 3 | Calendar & Email — Microsoft Graph integration | Planned |
 | 4 | IQ Tool Wrappers — PressureIQ, SignalIQ, etc. | Planned |
 | 5 | Cloud Fallback — Claude API for heavy reasoning | Planned |
@@ -58,7 +64,11 @@ axis/
   configs/axis.toml        # OpenJarvis configuration
   personas/axis.md          # Custom persona prompt
   speech/elevenlabs_tts.py  # ElevenLabs TTS backend
-  memory/lanes.py           # 5-lane memory schema
+  memory/lanes.py             # 5-lane schema + privacy rules + lane classifier
+  memory/supabase_backend.py  # Supabase + pgvector memory backend
+  memory/seed.py              # Seeds initial Pivot context into all 5 lanes
+  migrations/
+    001_memory_schema.sql   # Supabase migration — run in SQL editor
   skills/                   # IQ product tool wrappers (Phase 4)
   connectors/               # Custom connectors (Phase 3+)
   scripts/

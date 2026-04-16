@@ -26,8 +26,16 @@ context_from_memory = true
 
 # ── PILLAR 3: Tools ──────────────────────────
 [tools.storage]
-default_backend = "sqlite"
-db_path = "~/.axis/memory.db"
+# Phase 1: sqlite | Phase 2+: supabase
+default_backend = "supabase"
+db_path = "~/.axis/memory.db"  # fallback if Supabase unreachable
+
+[tools.storage.supabase]
+# Values read from environment — set in axis/.env
+url_env = "SUPABASE_URL"
+key_env = "SUPABASE_KEY"
+embed_model = "nomic-embed-text"
+embed_host = "http://localhost:11434"
 
 [tools.mcp]
 enabled = true
