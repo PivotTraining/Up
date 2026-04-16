@@ -5,8 +5,8 @@
 
 # ── PILLAR 1: Intelligence ───────────────────
 [intelligence]
+# Local model — always-on, free, private
 default_model = "qwen3:8b"
-fallback_model = "qwen3:8b"
 preferred_engine = "ollama"
 provider = "local"
 quantization = "none"
@@ -15,6 +15,12 @@ max_tokens = 2048
 top_p = 0.9
 top_k = 40
 repetition_penalty = 1.0
+
+# Cloud fallback — escalated by AxisCloudRouter when query warrants it
+# Reads ANTHROPIC_API_KEY from environment automatically
+fallback_model = "claude-sonnet-4-5"
+fallback_engine = "cloud"
+fallback_provider = "anthropic"
 
 # ── PILLAR 2: Agent ──────────────────────────
 [agent]
@@ -47,9 +53,18 @@ default = "ollama"
 [engine.ollama]
 host = "http://localhost:11434"
 
-# Cloud fallback — Phase 5
-# [engine.anthropic]
-# model = "claude-sonnet-4-6"
+# Cloud fallback — Phase 5 (active)
+# Routed by axis/intelligence/cloud_router.py
+# ANTHROPIC_API_KEY read from environment
+[engine.cloud]
+provider = "anthropic"
+# Routing rules — which lanes may leave the Mac
+# Options: always | complexity | never
+family_lane_cloud  = "never"
+self_lane_cloud    = "never"
+faith_lane_cloud   = "never"     # change to "complexity" to allow
+business_lane_cloud = "complexity"
+product_lane_cloud  = "complexity"
 
 # ── PILLAR 5: Learning ───────────────────────
 [learning]

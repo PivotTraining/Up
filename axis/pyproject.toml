@@ -13,6 +13,8 @@ dependencies = [
     "httpx>=0.27",
     # Phase 3 — Microsoft Graph
     "msal>=1.28",
+    # Phase 5 — Cloud fallback
+    "anthropic>=0.40",
 ]
 
 [project.optional-dependencies]
