@@ -29,6 +29,3 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["memory", "skills", "vault", "speech", "connectors", "intelligence", "server"]
-
-[tool.uv]
-python = "3.12"

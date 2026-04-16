@@ -42,7 +42,6 @@ SCOPES = [
     "Calendars.ReadWrite",
     "Mail.ReadWrite",
     "Mail.Send",
-    "offline_access",
 ]
 
 
@@ -121,7 +120,7 @@ class MSGraphAuth:
         cache_path: Path = TOKEN_CACHE_PATH,
     ) -> None:
         self._client_id = client_id or os.environ.get("MICROSOFT_CLIENT_ID", "")
-        self._tenant_id = tenant_id or os.environ.get("MICROSOFT_TENANT_ID", "common")
+        self._tenant_id = tenant_id or os.environ.get("MICROSOFT_TENANT_ID") or "common"
         self._cache_path = cache_path
         self._cache = msal.SerializableTokenCache()
 
@@ -185,7 +184,10 @@ class MSGraphClient:
     """
 
     def __init__(self, auth: Optional[MSGraphAuth] = None) -> None:
-        self._auth = auth or MSGraphAuth()
+        self._auth = auth or MSGraphAuth(
+            client_id=os.environ.get("MICROSOFT_CLIENT_ID", ""),
+            tenant_id=os.environ.get("MICROSOFT_TENANT_ID", "common"),
+        )
 
     def _headers(self) -> dict[str, str]:
         return {

@@ -65,7 +65,8 @@ def main() -> None:
             return
         TOKEN_CACHE_PATH.unlink()
 
-    auth = MSGraphAuth(client_id=client_id)
+    tenant_id = os.environ.get("MICROSOFT_TENANT_ID", "common")
+    auth = MSGraphAuth(client_id=client_id, tenant_id=tenant_id)
 
     print("\n  Starting Device Code Flow...")
     print("  ─────────────────────────────────────")
