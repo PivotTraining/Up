@@ -25,8 +25,17 @@ cd axis && uv run python scripts/test_voice_loop.py
 # 5. Seed initial Pivot context (Phase 2)
 cd axis && uv run python memory/seed.py
 
-# 6. Start Axis
+# 6. Start Axis (voice loop)
 bash axis/scripts/start.sh
+
+# 7. Launch the HUD overlay (Phase 7)
+# First-time only: install Rust + Tauri CLI
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+cargo install tauri-cli --version "^2.0"
+cd axis/hud && npm install
+
+# Then start the HUD (API bridge + Tauri window)
+bash axis/scripts/start_hud.sh
 ```
 
 ---
@@ -53,7 +62,7 @@ Three custom layers on top of the OpenJarvis five-pillar foundation:
 | 4 | IQ Tool Wrappers — OutreachIQ, PressureIQ, SignalIQ, CompatibleIQ | ✅ Complete |
 | 5 | Cloud Fallback — Claude API for heavy reasoning | ✅ Complete |
 | 6 | Vault Indexing & Specialty Tools | ✅ Complete |
-| 7 | HUD & Polish — Tauri desktop shell | Planned |
+| 7 | HUD & Polish — Tauri desktop shell | ✅ Complete |
 
 ---
 
@@ -94,9 +103,19 @@ axis/
     001_memory_schema.sql   # Supabase migration — run in SQL editor
     002_vault_index.sql     # Vault idempotency tracking table
   connectors/               # Custom connectors (Phase 3+)
+  server/
+    api.py                  # FastAPI bridge (port 7900) — /query, /brief, /ws/voice
+  hud/
+    index.html              # HUD UI (dark overlay, voice indicator, quick actions)
+    src/main.js             # Frontend logic — queries API, WebSocket voice state
+    src/style.css           # Glass-morphism dark theme
+    src-tauri/              # Tauri v2 Rust shell
+      src/lib.rs            # Always-on-top window + system tray
+      tauri.conf.json       # Window: 380x680, transparent, alwaysOnTop
   scripts/
     setup.sh                # One-shot install script
-    start.sh                # Launch Axis
+    start.sh                # Launch Axis (voice loop)
+    start_hud.sh            # Launch API server + Tauri HUD
     test_voice_loop.py      # Phase 1 smoke test
     index_vault.py          # Vault indexer CLI (--dry-run, --paths)
 ```

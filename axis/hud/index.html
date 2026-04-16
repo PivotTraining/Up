@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Axis</title>
+  <link rel="stylesheet" href="src/style.css" />
+</head>
+<body>
+  <div class="hud-container">
+
+    <!-- Drag handle / top bar -->
+    <div class="top-bar drag-region">
+      <div class="logo-area">
+        <span class="logo-text">AXIS</span>
+        <div class="voice-dot" id="voiceDot" data-state="idle" title="Voice status"></div>
+      </div>
+      <div class="status-line">
+        <span id="modelName">qwen3:8b</span>
+      </div>
+    </div>
+
+    <!-- Greeting -->
+    <div class="greeting-area">
+      <div class="greeting-text" id="greetingText">Good morning, Boss</div>
+      <div class="time-text" id="timeText">--:-- --</div>
+    </div>
+
+    <!-- Response area -->
+    <div class="response-area" id="responseArea">
+      <div class="empty-state">Ask Axis anything…</div>
+    </div>
+
+    <!-- Quick actions -->
+    <div class="quick-actions">
+      <button class="quick-btn" id="btnMorningBrief">Morning Brief</button>
+      <button class="quick-btn" id="btnSchoolCall">School Call</button>
+      <button class="quick-btn" id="btnDevotion">Devotion</button>
+      <button class="quick-btn" id="btnComposeEmail">Compose Email</button>
+    </div>
+
+    <!-- Input bar -->
+    <div class="input-bar">
+      <input
+        type="text"
+        id="queryInput"
+        class="query-input"
+        placeholder="Ask Axis…"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <button class="btn-primary send-btn" id="sendBtn">Send</button>
+    </div>
+
+  </div>
+
+  <script type="module" src="src/main.js"></script>
+</body>
+</html>
