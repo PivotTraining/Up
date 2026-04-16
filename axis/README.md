@@ -49,8 +49,8 @@ Three custom layers on top of the OpenJarvis five-pillar foundation:
 |-------|-------------|--------|
 | 1 | Local Foundation — OpenJarvis + Ollama + voice loop | ✅ Complete |
 | 2 | Memory & Persona — Supabase schema + 5 lanes | ✅ Complete |
-| 3 | Calendar & Email — Microsoft Graph integration | **In Progress** |
-| 4 | IQ Tool Wrappers — PressureIQ, SignalIQ, etc. | Planned |
+| 3 | Calendar & Email — Microsoft Graph integration | ✅ Complete |
+| 4 | IQ Tool Wrappers — OutreachIQ, PressureIQ, SignalIQ, CompatibleIQ | **In Progress** |
 | 5 | Cloud Fallback — Claude API for heavy reasoning | Planned |
 | 6 | Vault Indexing & Specialty Tools | Planned |
 | 7 | HUD & Polish — Tauri desktop shell | Planned |
@@ -75,6 +75,12 @@ axis/
     chief_of_staff.py       # Morning brief assembler
   scripts/
     auth_msgraph.py         # One-time Microsoft Graph OAuth setup
+  skills/
+    outreachiq.py           # OutreachIQ — fully wired (Supabase + HTTP)
+    pressureiq.py           # PressureIQ — interface ready, wire endpoints
+    signaliq.py             # SignalIQ — interface ready, wire endpoints
+    compatibleiq.py         # CompatibleIQ — interface ready, wire endpoints
+    iq_router.py            # Intent → IQ tool dispatcher
   connectors/               # Custom connectors (Phase 3+)
   scripts/
     setup.sh                # One-shot install script
