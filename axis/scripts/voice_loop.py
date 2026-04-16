@@ -52,6 +52,8 @@ SILENCE_SECONDS   = 1.2          # pause after which we assume speech ended
 SILENCE_CHUNKS    = int(SILENCE_SECONDS * 1000 / CHUNK_MS)
 MIN_SPEECH_SEC    = 0.4          # ignore clips shorter than this
 VAD_MULTIPLIER    = 2.5          # how many × ambient noise = speech
+WAKE_WORDS        = ["axis"]     # say any of these to activate
+WAKE_WINDOW_SEC   = 6.0          # seconds to capture command after wake word
 WHISPER_MODEL     = "base.en"
 LLM_MODEL         = "qwen3:8b"
 OLLAMA_URL        = "http://localhost:11434/api/generate"
@@ -207,15 +209,53 @@ def _mic_callback(indata: np.ndarray, frames: int, time_info, status) -> None:
         _audio_queue.put(indata.copy())
 
 
+# ── Wake word check ───────────────────────────────────────────────────────────
+
+def _contains_wake_word(text: str) -> bool:
+    low = text.lower()
+    return any(w in low for w in WAKE_WORDS)
+
+
+def _strip_wake_word(text: str) -> str:
+    """Remove 'Axis' from the start of a command if present."""
+    low = text.lower().strip()
+    for w in WAKE_WORDS:
+        if low.startswith(w):
+            remainder = text[len(w):].strip(" ,.")
+            return remainder
+    return text
+
+
 # ── Main listen loop ──────────────────────────────────────────────────────────
 
 def _listen_loop(whisper, threshold: float) -> None:
-    pre_buffer: deque = deque(maxlen=10)  # keep ~300ms before speech onset
-    recording   = False
-    speech_buf: list[np.ndarray] = []
-    silent_chunks = 0
+    """
+    Two-phase loop:
 
-    print(f"{_tag('AXIS', GREEN)} Listening…\n", flush=True)
+    PHASE 1 — Wake word scanning:
+      Always recording audio in a rolling window (~3s).
+      Every 2.5 seconds, transcribes the window to check for "Axis".
+      Cheap and fast — just checking for the wake word.
+
+    PHASE 2 — Command capture:
+      Triggered once "Axis" is heard.
+      Records until 1.2s of silence, then sends full command to LLM.
+      The command may be in the same utterance as the wake word
+      ("Axis, what's on my calendar") or spoken right after.
+    """
+    # Rolling window for wake word detection (~3 seconds of audio)
+    WAKE_WINDOW_CHUNKS = int(3.0 * 1000 / CHUNK_MS)
+    wake_buffer: deque = deque(maxlen=WAKE_WINDOW_CHUNKS)
+    last_wake_check = time.time()
+    WAKE_CHECK_INTERVAL = 2.5   # check for wake word every N seconds
+
+    # Command capture state
+    capturing     = False
+    command_buf: list[np.ndarray] = []
+    silent_chunks = 0
+    pre_buffer: deque = deque(maxlen=10)
+
+    print(f"{_tag('AXIS', GREEN)} Listening for wake word: say  '{CYAN}Axis{RESET}{GREEN}'…\n", flush=True)
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
@@ -233,54 +273,92 @@ def _listen_loop(whisper, threshold: float) -> None:
             data = chunk.flatten().astype(np.float32)
             rms  = float(np.sqrt(np.mean(data ** 2)))
 
-            if not recording:
-                pre_buffer.append(chunk)
-                if rms > threshold:
-                    # Speech onset
-                    recording    = True
-                    silent_chunks = 0
-                    speech_buf   = list(pre_buffer)
-                    print(f"{_tag('YOU', GREEN)} Speaking…", flush=True, end="\r")
+            # Always fill wake buffer and pre-buffer
+            wake_buffer.append(chunk)
+            pre_buffer.append(chunk)
+
+            # ── PHASE 1: Wake word scanning ──────────────────────────────
+            if not capturing:
+                now = time.time()
+                if now - last_wake_check >= WAKE_CHECK_INTERVAL and len(wake_buffer) > 5:
+                    last_wake_check = now
+                    window = np.concatenate(list(wake_buffer)).flatten()
+                    # Only transcribe if there was some speech in the window
+                    window_rms = float(np.sqrt(np.mean(window.astype(np.float32) ** 2)))
+                    if window_rms > threshold * 0.6:
+                        snip = _transcribe(whisper, window)
+                        if snip:
+                            print(f"{GREY}  … {snip}{RESET}", flush=True, end="\r")
+                        if _contains_wake_word(snip):
+                            print(f"\n{_tag('AXIS', PURPLE)} Wake word detected! Listening for command…", flush=True)
+                            _play_chime()
+                            capturing     = True
+                            command_buf   = list(pre_buffer)  # include audio just before wake
+                            silent_chunks = 0
+                            wake_buffer.clear()
+                continue  # don't fall through to phase 2 on same chunk
+
+            # ── PHASE 2: Command capture ──────────────────────────────────
+            command_buf.append(chunk)
+            if rms < threshold:
+                silent_chunks += 1
             else:
-                speech_buf.append(chunk)
-                if rms < threshold:
-                    silent_chunks += 1
+                silent_chunks = 0
+
+            # Enforce max window so it doesn't record forever
+            max_chunks = int(WAKE_WINDOW_SEC * 1000 / CHUNK_MS)
+            if silent_chunks >= SILENCE_CHUNKS or len(command_buf) >= max_chunks:
+                capturing = False
+                audio     = np.concatenate(command_buf).flatten()
+                duration  = len(audio) / SAMPLE_RATE
+                command_buf   = []
+                silent_chunks = 0
+
+                if duration < MIN_SPEECH_SEC:
+                    print(f"{_tag('AXIS', YELLOW)} Nothing after wake word — listening…\n", flush=True)
+                    continue
+
+                print(f"\n{_tag('STT', CYAN)} Transcribing {duration:.1f}s…", flush=True)
+                text = _transcribe(whisper, audio)
+
+                if not text or len(text.strip()) < 2:
+                    print(f"{_tag('AXIS', YELLOW)} Didn't catch that — listening…\n", flush=True)
+                    continue
+
+                # Strip "Axis" from front if it carried through
+                command = _strip_wake_word(text)
+                if not command:
+                    # Just the wake word, no command — ask what they need
+                    command = "yes"  # triggers "What do you need?" response
+
+                print(f"{GREEN}{BOLD}You:{RESET} {command}", flush=True)
+
+                low = command.lower()
+                if any(w in low for w in ["morning brief", "brief me", "what's on", "whats on", "my day", "calendar"]):
+                    _handle_brief()
                 else:
-                    silent_chunks = 0
+                    print(f"{_tag('LLM', CYAN)} Thinking…", flush=True)
+                    answer = _query_llm(command)
+                    _speak(answer)
 
-                if silent_chunks >= SILENCE_CHUNKS:
-                    # End of speech
-                    recording = False
-                    audio     = np.concatenate(speech_buf).flatten()
-                    duration  = len(audio) / SAMPLE_RATE
+                print(f"\n{_tag('AXIS', GREEN)} Listening for  '{CYAN}Axis{RESET}{GREEN}'…\n", flush=True)
 
-                    if duration < MIN_SPEECH_SEC:
-                        print(f"{_tag('AXIS', YELLOW)} Too short — listening…", flush=True)
-                        speech_buf   = []
-                        silent_chunks = 0
-                        continue
 
-                    print(f"\n{_tag('STT', CYAN)} Transcribing {duration:.1f}s…", flush=True)
-                    text = _transcribe(whisper, audio)
-                    speech_buf   = []
-                    silent_chunks = 0
+# ── Chime ─────────────────────────────────────────────────────────────────────
 
-                    if not text or len(text.strip()) < 2:
-                        print(f"{_tag('AXIS', YELLOW)} Didn't catch that — listening…\n", flush=True)
-                        continue
-
-                    print(f"{GREEN}{BOLD}You:{RESET} {text}", flush=True)
-
-                    # Check for brief command
-                    low = text.lower()
-                    if any(w in low for w in ["morning brief", "brief me", "what's on", "whats on", "my day"]):
-                        _handle_brief()
-                    else:
-                        print(f"{_tag('LLM', CYAN)} Thinking…", flush=True)
-                        answer = _query_llm(text)
-                        _speak(answer)
-
-                    print(f"{_tag('AXIS', GREEN)} Listening…\n", flush=True)
+def _play_chime() -> None:
+    """Short two-tone chime to confirm wake word heard."""
+    try:
+        sr = 22050
+        t1 = np.linspace(0, 0.08, int(sr * 0.08), False)
+        t2 = np.linspace(0, 0.08, int(sr * 0.08), False)
+        tone1 = (np.sin(2 * np.pi * 880 * t1) * 0.3).astype(np.float32)
+        tone2 = (np.sin(2 * np.pi * 1100 * t2) * 0.3).astype(np.float32)
+        chime = np.concatenate([tone1, np.zeros(int(sr * 0.03), dtype=np.float32), tone2])
+        sd.play(chime, samplerate=sr)
+        sd.wait()
+    except Exception:
+        pass
 
 
 # ── Brief handler ─────────────────────────────────────────────────────────────
@@ -307,7 +385,7 @@ def main() -> None:
 
     now      = datetime.now().strftime("%A, %B %d, %Y")
     location = os.environ.get("AXIS_LOCATION", "Atlanta, Georgia")
-    _speak(f"Axis is live. {now}, {location}. I'm always listening, Boss.")
+    _speak(f"Axis is live. {now}, {location}. Say my name to wake me up, Boss.")
 
     try:
         _listen_loop(whisper, threshold)
