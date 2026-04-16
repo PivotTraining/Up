@@ -44,7 +44,12 @@ fi
 info "Starting Axis..."
 echo ""
 cd "$AXIS_DIR"
-exec uv run jarvis ask \
-    --config "$AXIS_DIR/configs/axis.toml" \
-    --persona "$AXIS_DIR/personas/axis.md" \
-    --agent native_react
+
+PERSONA="$(cat "$AXIS_DIR/personas/axis.md")"
+
+exec uv run jarvis chat \
+    --model "qwen3:8b" \
+    --engine "ollama" \
+    --agent "native_react" \
+    --tools "think,web_search,knowledge_search,memory_manage,file_read,calculator" \
+    --system "$PERSONA"
