@@ -48,8 +48,8 @@ Three custom layers on top of the OpenJarvis five-pillar foundation:
 | Phase | Description | Status |
 |-------|-------------|--------|
 | 1 | Local Foundation — OpenJarvis + Ollama + voice loop | ✅ Complete |
-| 2 | Memory & Persona — Supabase schema + 5 lanes | **In Progress** |
-| 3 | Calendar & Email — Microsoft Graph integration | Planned |
+| 2 | Memory & Persona — Supabase schema + 5 lanes | ✅ Complete |
+| 3 | Calendar & Email — Microsoft Graph integration | **In Progress** |
 | 4 | IQ Tool Wrappers — PressureIQ, SignalIQ, etc. | Planned |
 | 5 | Cloud Fallback — Claude API for heavy reasoning | Planned |
 | 6 | Vault Indexing & Specialty Tools | Planned |
@@ -69,7 +69,12 @@ axis/
   memory/seed.py              # Seeds initial Pivot context into all 5 lanes
   migrations/
     001_memory_schema.sql   # Supabase migration — run in SQL editor
-  skills/                   # IQ product tool wrappers (Phase 4)
+  skills/
+    calendar_skill.py       # Calendar read (today/tomorrow/week)
+    email_skill.py          # Email triage, draft, send
+    chief_of_staff.py       # Morning brief assembler
+  scripts/
+    auth_msgraph.py         # One-time Microsoft Graph OAuth setup
   connectors/               # Custom connectors (Phase 3+)
   scripts/
     setup.sh                # One-shot install script

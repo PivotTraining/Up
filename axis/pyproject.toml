@@ -11,6 +11,8 @@ dependencies = [
     # Phase 2 — memory
     "supabase>=2.0",
     "httpx>=0.27",
+    # Phase 3 — Microsoft Graph
+    "msal>=1.28",
 ]
 
 [project.optional-dependencies]
